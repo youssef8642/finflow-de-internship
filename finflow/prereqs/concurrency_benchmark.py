@@ -1,10 +1,22 @@
+from pathlib import Path
 import os
 import time
 import requests
 import psutil
+import sys
 from typing import Union
 from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import ProcessPoolExecutor
+
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from finflow.config.logger import get_logger
+
+
+logger = get_logger(__name__)
 
 
 URLS = [
@@ -131,6 +143,7 @@ def run_parallel(inputs: list[int]) -> tuple[list[int], dict[str, Union[float, i
 
 
 if __name__ == "__main__":
+    logger.info("Starting concurrency benchmark")
     seq_start = time.perf_counter()
     seq_sizes = fetch_sequential(URLS)
     seq_time = time.perf_counter() - seq_start
@@ -153,7 +166,7 @@ if __name__ == "__main__":
     print(f"ThreadPool(5) | {par_time:.2f} | {speedup:.1f}x")
 
     if seq_sizes != par_sizes:
-        print("Warning: sequential and parallel response sizes differ.")
+        logger.warning("Sequential and parallel response sizes differ.")
 
     print()
     print("Part B - CPU-bound benchmark")
@@ -189,7 +202,7 @@ if __name__ == "__main__":
     print(f"Process count: {par_metrics['process_count']}")
 
     if seq_results != par_results:
-        print("Warning: sequential and parallel results differ.")
+        logger.warning("Sequential and parallel results differ.")
 
 # ThreadPoolExecutor works well in Part A because the requests spend most of their time waiting on network I/O instead of using the CPU.
 # That waiting time lets other threads run, so the total download time drops even though the work is still done in one Python process.
