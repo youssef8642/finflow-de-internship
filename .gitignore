@@ -43,3 +43,6 @@ data/
 
 # Logs
 *.log
+
+
+.env
