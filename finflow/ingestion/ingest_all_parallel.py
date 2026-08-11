@@ -67,18 +67,6 @@ def run_parallel(max_workers: int = 3) -> None:
 
 
 def benchmark_ingestion() -> None:
-    """Compare sequential and parallel ingestion times."""
-
-    print("\nRunning sequential ingestion...")
-
-    sequential_start = time.perf_counter()
-
-    run_sequential()
-
-    sequential_time = (
-        time.perf_counter()
-        - sequential_start
-    )
 
     print("\nRunning parallel ingestion...")
 
@@ -91,11 +79,6 @@ def benchmark_ingestion() -> None:
         - parallel_start
     )
 
-    speedup = (
-        sequential_time / parallel_time
-        if parallel_time > 0
-        else 0
-    )
 
     print("\n" + "=" * 60)
     print("INGESTION BENCHMARK")
@@ -108,10 +91,6 @@ def benchmark_ingestion() -> None:
 
     print("-" * 60)
 
-    print(
-        f"{'Sequential':<20}"
-        f"{sequential_time:>20.2f}"
-    )
 
     print(
         f"{'Parallel':<20}"
@@ -120,10 +99,7 @@ def benchmark_ingestion() -> None:
 
     print("-" * 60)
 
-    print(
-        f"{'Speedup':<20}"
-        f"{speedup:>20.2f}x"
-    )
+    
 
     print("=" * 60)
 
