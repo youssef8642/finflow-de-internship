@@ -1,16 +1,15 @@
----
-config:
-  layout: elk
----
+# FinFlow Database Schema
+
+```mermaid
 erDiagram
 
-    DIM_TRANSACTION_TYPE ||--o{ FACT_TRANSACTIONS : "type of transaction(joined on transaction_type_id)"
+    DIM_TRANSACTION_TYPE ||--o{ FACT_TRANSACTIONS : "type of transaction"
 
-    DIM_TIME ||--o{ FACT_TRANSACTIONS : "time(joined on step)"
+    DIM_TIME ||--o{ FACT_TRANSACTIONS : "time"
 
-    DIM_ACCOUNT ||--o{ FACT_TRANSACTIONS : "sender(joined on sender_account_id)"
+    DIM_ACCOUNT ||--o{ FACT_TRANSACTIONS : "sender"
 
-    DIM_ACCOUNT ||--o{ FACT_TRANSACTIONS : "receiver(joined on reciever_account_id)"
+    DIM_ACCOUNT ||--o{ FACT_TRANSACTIONS : "receiver"
 
 
     DIM_TRANSACTION_TYPE {
@@ -57,3 +56,4 @@ erDiagram
         VARCHAR state
         VARCHAR resolution
     }
+```
