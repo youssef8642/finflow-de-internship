@@ -10,7 +10,7 @@ The ingestion pipeline was tested using both sequential and parallel execution.
 | Parallel   |         145.71 |
 | Speedup    |          1.19x |
 
-The parallel implementation reduced the total wall-clock time by approximately 16%.
+The parallel implementation reduced the total wall-clock time by approximately 19%.
 
 ## Why Parallel Ingestion Was Faster
 
@@ -40,9 +40,7 @@ The main consideration is that repeated benchmark runs access the same output fi
 
 Thread-based parallelism was appropriate because the ingestion pipeline contains significant I/O activity. The measured result was a 1.19x speedup, reducing execution time from 173.38 seconds to 145.71 seconds.
 
-# Ingestion Notes
-
-## Parallel Transformation — Chunk Size Analysis
+## Milestone 1.4 — Parallel Transformation
 
 The PaySim dataset contains 6,362,620 rows. The transformation was performed using `ProcessPoolExecutor` with 4 workers.
 

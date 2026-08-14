@@ -1,256 +1,190 @@
-import duckdb
+"""Load the transformed dataset into the DuckDB star schema.
+
+Run with --reload to drop and recreate the tables from schema.sql. Without
+it the tables are truncated before loading, so either way running the script
+twice leaves the database in the same state.
+"""
+
+from __future__ import annotations
+
+import argparse
 from pathlib import Path
 from concurrent.futures import ProcessPoolExecutor
+
+import duckdb
+import pandas as pd
 
 from finflow.config.logger import get_logger
 from finflow.config.settings import PipelineConfig
 from finflow.models.data_quality import run_quality_checks
 
 
-# --------------------------------------------------
-# Logger
-# --------------------------------------------------
-
 logger = get_logger(__name__)
 
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+CONFIG = PipelineConfig()
 
-# --------------------------------------------------
-# Configuration
-# --------------------------------------------------
+DATABASE_PATH = PROJECT_ROOT / CONFIG.db_path
+SCHEMA_PATH = PROJECT_ROOT / "finflow" / "models" / "schema.sql"
+VIEWS_PATH = PROJECT_ROOT / "finflow" / "models" / "views.sql"
 
-config = PipelineConfig()
+PROCESSED_DIR = PROJECT_ROOT / CONFIG.processed_dir
+TRANSACTIONS_PATH = PROCESSED_DIR / "transactions_transformed.parquet"
+COMPLAINTS_PATH = PROCESSED_DIR / "complaints.parquet"
+
+# fact_transactions holds the foreign keys, so it has to go first.
+TABLES_IN_TEARDOWN_ORDER = [
+    "fact_transactions",
+    "complaints",
+    "dim_time",
+    "dim_account",
+    "dim_transaction_type",
+]
+
+FACT_COLUMNS = [
+    "transaction_id",
+    "step",
+    "transaction_type_id",
+    "amount",
+    "log_amount",
+    "balance_drain",
+    "name_orig",
+    "name_dest",
+    "is_fraud",
+    "is_flagged_fraud",
+    "old_balance_sender",
+    "new_balance_sender",
+    "old_balance_receiver",
+    "new_balance_receiver",
+]
+
+BALANCE_RENAMES = {
+    "old_balance_org": "old_balance_sender",
+    "new_balance_org": "new_balance_sender",
+    "old_balance_dest": "old_balance_receiver",
+    "new_balance_dest": "new_balance_receiver",
+}
 
 
-# --------------------------------------------------
-# Paths
-# --------------------------------------------------
+def open_database() -> duckdb.DuckDBPyConnection:
+    """Open the DuckDB database with the progress bar turned off."""
+    DATABASE_PATH.parent.mkdir(parents=True, exist_ok=True)
 
-database_path = Path(
-    config.db_path
-)
-
-schema_path = Path(
-    "finflow/models/schema.sql"
-)
-
-parquet_path = Path(
-    config.processed_dir
-) / "transactions_transformed_1000000.parquet"
-
-complaints_path = Path(
-    config.processed_dir
-) / "complaints.parquet"
-
-
-# --------------------------------------------------
-# Create / open DuckDB database
-# --------------------------------------------------
-
-def create_database():
-
-    connection = duckdb.connect(
-        str(database_path)
-    )
-
-    connection.execute(
-        "PRAGMA enable_progress_bar=false"
-    )
-
-    schema_sql = schema_path.read_text()
-
-    connection.execute(
-        schema_sql
-    )
-
-    logger.info(
-        "DuckDB database opened"
-    )
-
-    logger.info(
-        "Schema loaded from %s",
-        schema_path
-    )
-
+    connection = duckdb.connect(str(DATABASE_PATH))
+    connection.execute("PRAGMA enable_progress_bar=false")
     return connection
 
 
-# --------------------------------------------------
-# Load transaction type dimension
-# --------------------------------------------------
+def create_tables(connection: duckdb.DuckDBPyConnection, reload: bool) -> None:
+    """Create the schema, optionally dropping the existing tables first."""
+    if reload:
+        logger.info("Reload requested, dropping existing tables")
+        for table in TABLES_IN_TEARDOWN_ORDER:
+            connection.execute(f"DROP TABLE IF EXISTS {table}")
 
-def load_transaction_types(connection):
+    connection.execute(SCHEMA_PATH.read_text())
+    logger.info("Schema loaded from %s", SCHEMA_PATH)
 
-    logger.info(
-        "Loading dim_transaction_type"
-    )
+
+def truncate_tables(connection: duckdb.DuckDBPyConnection) -> None:
+    """Empty every table so a repeated run cannot duplicate rows."""
+    for table in TABLES_IN_TEARDOWN_ORDER:
+        connection.execute(f"DELETE FROM {table}")
+
+    logger.info("Existing rows cleared from all tables")
+
+
+def load_transaction_types(connection: duckdb.DuckDBPyConnection) -> None:
+    """Populate dim_transaction_type from the distinct types in the source."""
+    logger.info("Loading dim_transaction_type")
 
     connection.execute(
         f"""
-        INSERT INTO dim_transaction_type (
-            id,
-            type_name
-        )
-
-        SELECT
-            ROW_NUMBER() OVER (
-                ORDER BY type
-            ) AS id,
-
-            type AS type_name
-
+        INSERT INTO dim_transaction_type (id, type_name)
+        SELECT ROW_NUMBER() OVER (ORDER BY type) AS id, type AS type_name
         FROM (
             SELECT DISTINCT type
-
-            FROM read_parquet(
-                '{parquet_path}'
-            )
+            FROM read_parquet('{TRANSACTIONS_PATH.as_posix()}')
         )
         """
     )
 
-    count = connection.execute(
-        """
-        SELECT COUNT(*)
-        FROM dim_transaction_type
-        """
-    ).fetchone()[0]
-
-    logger.info(
-        "Transaction types loaded: %s",
-        count
-    )
+    count = connection.execute("SELECT COUNT(*) FROM dim_transaction_type").fetchone()[0]
+    logger.info("Transaction types loaded: %s", count)
 
 
-# --------------------------------------------------
-# Load account dimension
-# --------------------------------------------------
+def transaction_type_map(connection: duckdb.DuckDBPyConnection) -> dict[str, int]:
+    """Read the transaction type surrogate keys back out of the dimension.
 
-def load_accounts(connection):
+    The workers need to map type names to ids. Reading the mapping back
+    instead of hardcoding it means the two can never drift apart.
+    """
+    rows = connection.execute(
+        "SELECT type_name, id FROM dim_transaction_type"
+    ).fetchall()
 
-    logger.info(
-        "Loading dim_account"
-    )
+    return dict(rows)
+
+
+def load_accounts(connection: duckdb.DuckDBPyConnection) -> None:
+    """Populate dim_account from both the sender and receiver name columns."""
+    logger.info("Loading dim_account")
+
+    source = TRANSACTIONS_PATH.as_posix()
 
     connection.execute(
         f"""
-        INSERT INTO dim_account (
-            id,
-            name
-        )
-
-        SELECT
-            ROW_NUMBER() OVER (
-                ORDER BY name
-            ) AS id,
-
-            name
-
+        INSERT INTO dim_account (id, name)
+        SELECT ROW_NUMBER() OVER (ORDER BY name) AS id, name
         FROM (
-            SELECT name_orig AS name
-
-            FROM read_parquet(
-                '{parquet_path}'
-            )
-
+            SELECT name_orig AS name FROM read_parquet('{source}')
             UNION
-
-            SELECT name_dest AS name
-
-            FROM read_parquet(
-                '{parquet_path}'
-            )
+            SELECT name_dest AS name FROM read_parquet('{source}')
         )
         """
     )
 
-    count = connection.execute(
-        """
-        SELECT COUNT(*)
-        FROM dim_account
-        """
-    ).fetchone()[0]
-
-    logger.info(
-        "Accounts loaded: %s",
-        count
-    )
+    count = connection.execute("SELECT COUNT(*) FROM dim_account").fetchone()[0]
+    logger.info("Accounts loaded: %s", count)
 
 
-# --------------------------------------------------
-# Load time dimension
-# --------------------------------------------------
+def load_time(connection: duckdb.DuckDBPyConnection) -> None:
+    """Populate dim_time by deriving calendar fields from the PaySim step.
 
-def load_time(connection):
-
-    logger.info(
-        "Loading dim_time"
-    )
+    Steps are 1-indexed hours, so subtract 1 before dividing. The division
+    has to be integer division -- DuckDB's / returns a DOUBLE, which then
+    gets rounded on insert into an INTEGER column and shifts every day
+    boundary by half a day.
+    """
+    logger.info("Loading dim_time")
 
     connection.execute(
         f"""
-        INSERT INTO dim_time (
-            step,
-            sim_day,
-            sim_week,
-            hour_of_day
-        )
-
+        INSERT INTO dim_time (step, sim_day, sim_week, hour_of_day)
         SELECT
             step,
-
-            ((step - 1) / 24) + 1
-                AS sim_day,
-
-            ((step - 1) / 168) + 1
-                AS sim_week,
-
-            ((step - 1) % 24)
-                AS hour_of_day
-
-        FROM read_parquet(
-            '{parquet_path}'
-        )
-
+            ((step - 1) // 24) + 1 AS sim_day,
+            ((step - 1) // 168) + 1 AS sim_week,
+            ((step - 1) % 24) AS hour_of_day
+        FROM read_parquet('{TRANSACTIONS_PATH.as_posix()}')
         GROUP BY step
         """
     )
 
-    count = connection.execute(
-        """
-        SELECT COUNT(*)
-        FROM dim_time
-        """
-    ).fetchone()[0]
-
-    logger.info(
-        "Time records loaded: %s",
-        count
-    )
+    count = connection.execute("SELECT COUNT(*) FROM dim_time").fetchone()[0]
+    logger.info("Time records loaded: %s", count)
 
 
-# --------------------------------------------------
-# Load complaints
-# --------------------------------------------------
-
-def load_complaints(connection):
-
-    logger.info(
-        "Loading complaints"
-    )
+def load_complaints(connection: duckdb.DuckDBPyConnection) -> None:
+    """Populate the complaints table from the ingested CFPB Parquet."""
+    logger.info("Loading complaints")
 
     connection.execute(
         f"""
         INSERT INTO complaints (
-            complaint_id,
-            date_received,
-            product,
-            sub_product,
-            issue,
-            company,
-            state,
-            resolution
+            complaint_id, date_received, product, sub_product,
+            issue, company, state, resolution
         )
-
         SELECT
             "Complaint ID",
             "Date received",
@@ -260,552 +194,232 @@ def load_complaints(connection):
             Company,
             State,
             "Company response to consumer"
-
-        FROM read_parquet(
-            '{complaints_path}'
-        )
+        FROM read_parquet('{COMPLAINTS_PATH.as_posix()}')
         """
     )
 
-    count = connection.execute(
-        """
-        SELECT COUNT(*)
-        FROM complaints
-        """
-    ).fetchone()[0]
-
-    logger.info(
-        "Complaints loaded: %s",
-        count
-    )
+    count = connection.execute("SELECT COUNT(*) FROM complaints").fetchone()[0]
+    logger.info("Complaints loaded: %s", count)
 
 
-# --------------------------------------------------
-# Create transaction chunks
-# --------------------------------------------------
-
-def create_chunks(
-    parquet_path,
-    chunk_size
-):
-
-    connection = duckdb.connect()
-
-    connection.execute(
-        "PRAGMA enable_progress_bar=false"
-    )
-
-    total_rows = connection.execute(
+def create_chunks(connection: duckdb.DuckDBPyConnection, chunk_size: int) -> list[tuple[int, int]]:
+    """Split the transaction id range into inclusive (start, end) windows."""
+    min_id, max_id, total = connection.execute(
         f"""
-        SELECT COUNT(*)
-        FROM read_parquet(
-            '{parquet_path}'
-        )
+        SELECT MIN(transaction_id), MAX(transaction_id), COUNT(*)
+        FROM read_parquet('{TRANSACTIONS_PATH.as_posix()}')
         """
-    ).fetchone()[0]
+    ).fetchone()
 
-    connection.close()
+    chunks = [
+        (start, min(start + chunk_size - 1, max_id))
+        for start in range(min_id, max_id + 1, chunk_size)
+    ]
 
-    chunks = []
-
-    for start in range(
-        0,
-        total_rows,
-        chunk_size
-    ):
-
-        end = min(
-            start + chunk_size,
-            total_rows
-        )
-
-        chunks.append(
-            (
-                start,
-                end
-            )
-        )
-
-    logger.info(
-        "Source transaction rows: %s",
-        total_rows
-    )
-
-    logger.info(
-        "Chunk size: %s",
-        chunk_size
-    )
-
-    logger.info(
-        "Total chunks created: %s",
-        len(chunks)
-    )
-
+    logger.info("Source transaction rows: %s", total)
+    logger.info("Chunk size: %s", chunk_size)
+    logger.info("Total chunks created: %s", len(chunks))
     return chunks
 
 
-# --------------------------------------------------
-# Read one transaction chunk
-# --------------------------------------------------
+def read_chunk(source: str, start_id: int, end_id: int) -> pd.DataFrame:
+    """Read one id window out of the transformed Parquet.
 
-def read_chunk(
-    parquet_path,
-    start,
-    end
-):
+    Filtering on transaction_id rather than using LIMIT/OFFSET keeps the
+    chunk boundaries deterministic -- DuckDB does not guarantee Parquet scan
+    order -- and lets row group statistics skip most of the file.
+    """
+    with duckdb.connect() as connection:
+        connection.execute("PRAGMA enable_progress_bar=false")
 
-    connection = duckdb.connect()
-
-    connection.execute(
-        "PRAGMA enable_progress_bar=false"
-    )
-
-    chunk = connection.execute(
-        f"""
-        SELECT *
-        FROM read_parquet(
-            '{parquet_path}'
-        )
-
-        LIMIT {end - start}
-
-        OFFSET {start}
-        """
-    ).df()
-
-    connection.close()
-
-    return chunk
+        return connection.execute(
+            f"""
+            SELECT *
+            FROM read_parquet('{source}')
+            WHERE transaction_id BETWEEN {start_id} AND {end_id}
+            """
+        ).df()
 
 
-# --------------------------------------------------
-# Transform one chunk
-# --------------------------------------------------
-
-def transform_chunk(
-    chunk,
-    start
-):
-
+def prepare_chunk(chunk: pd.DataFrame, type_map: dict[str, int]) -> pd.DataFrame:
+    """Map the type name to its surrogate key and align the column names."""
     chunk = chunk.copy()
+    chunk["transaction_type_id"] = chunk["type"].map(type_map)
+    chunk = chunk.rename(columns=BALANCE_RENAMES)
+    return chunk[FACT_COLUMNS]
 
-    chunk["transaction_id"] = (
-        range(
-            start + 1,
-            start + len(chunk) + 1
+
+def process_chunk(arguments: tuple[str, int, int, dict[str, int], str]) -> str:
+    """Worker entry point: read one chunk, prepare it, stage it as Parquet."""
+    source, start_id, end_id, type_map, staging_dir = arguments
+
+    chunk = prepare_chunk(read_chunk(source, start_id, end_id), type_map)
+    temp_path = Path(staging_dir) / f"temp_chunk_{start_id}.parquet"
+
+    with duckdb.connect() as connection:
+        connection.execute("PRAGMA enable_progress_bar=false")
+        connection.register("chunk", chunk)
+        connection.execute(
+            f"COPY chunk TO '{temp_path.as_posix()}' (FORMAT PARQUET)"
         )
-    )
-
-    chunk["transaction_type_id"] = (
-        chunk["type"]
-        .map(
-            {
-                "CASH_IN": 1,
-                "CASH_OUT": 2,
-                "DEBIT": 3,
-                "PAYMENT": 4,
-                "TRANSFER": 5,
-            }
-        )
-    )
-
-    chunk = chunk.rename(
-        columns={
-            "old_balance_org":
-                "old_balance_sender",
-
-            "new_balance_org":
-                "new_balance_sender",
-
-            "old_balance_dest":
-                "old_balance_receiver",
-
-            "new_balance_dest":
-                "new_balance_receiver",
-        }
-    )
-
-    return chunk[
-        [
-            "transaction_id",
-            "step",
-            "transaction_type_id",
-            "amount",
-            "log_amount",
-            "balance_drain",
-            "name_orig",
-            "name_dest",
-            "is_fraud",
-            "is_flagged_fraud",
-            "old_balance_sender",
-            "new_balance_sender",
-            "old_balance_receiver",
-            "new_balance_receiver",
-        ]
-    ]
-
-
-# --------------------------------------------------
-# Process one transaction chunk
-# --------------------------------------------------
-
-def process_chunk(arguments):
-
-    (
-        parquet_path,
-        start,
-        end
-    ) = arguments
-
-    chunk = read_chunk(
-        parquet_path,
-        start,
-        end
-    )
-
-    chunk = transform_chunk(
-        chunk,
-        start
-    )
-
-    temp_path = Path(
-        "data/processed"
-    ) / f"temp_chunk_{start}.parquet"
-
-    connection = duckdb.connect()
-
-    connection.execute(
-        "PRAGMA enable_progress_bar=false"
-    )
-
-    connection.register(
-        "chunk",
-        chunk
-    )
-
-    connection.execute(
-        f"""
-        COPY chunk
-        TO '{temp_path}'
-        (
-            FORMAT PARQUET
-        )
-        """
-    )
-
-    connection.close()
 
     return str(temp_path)
 
 
-# --------------------------------------------------
-# Insert processed chunks into DuckDB
-# --------------------------------------------------
-
 def insert_chunks(
-    connection,
-    temp_files
-):
-
+    connection: duckdb.DuckDBPyConnection,
+    temp_files: list[str],
+) -> int:
+    """Insert every staged chunk into fact_transactions, resolving the FKs."""
+    logger.info("Inserting processed chunks into fact_transactions")
     total_rows = 0
 
-    logger.info(
-        "Inserting processed chunks into fact_transactions"
-    )
-
     for temp_file in temp_files:
+        source = Path(temp_file).as_posix()
 
         rows = connection.execute(
-            f"""
-            SELECT COUNT(*)
-            FROM read_parquet(
-                '{temp_file}'
-            )
-            """
+            f"SELECT COUNT(*) FROM read_parquet('{source}')"
         ).fetchone()[0]
 
         connection.execute(
             f"""
             INSERT INTO fact_transactions (
-                transaction_id,
-                step,
-                transaction_type_id,
-                amount,
-                log_amount,
-                balance_drain,
-                sender_account_id,
-                receiver_account_id,
-                is_fraud,
-                is_flagged_fraud,
-                old_balance_sender,
-                new_balance_sender,
-                old_balance_receiver,
-                new_balance_receiver
+                transaction_id, step, transaction_type_id, amount, log_amount,
+                balance_drain, sender_account_id, receiver_account_id,
+                is_fraud, is_flagged_fraud, old_balance_sender,
+                new_balance_sender, old_balance_receiver, new_balance_receiver
             )
-
             SELECT
                 chunk.transaction_id,
-
                 chunk.step,
-
                 chunk.transaction_type_id,
-
                 chunk.amount,
-
                 chunk.log_amount,
-
                 chunk.balance_drain,
-
                 sender.id,
-
                 receiver.id,
-
                 chunk.is_fraud,
-
                 chunk.is_flagged_fraud,
-
                 chunk.old_balance_sender,
-
                 chunk.new_balance_sender,
-
                 chunk.old_balance_receiver,
-
                 chunk.new_balance_receiver
-
-            FROM read_parquet(
-                '{temp_file}'
-            ) AS chunk
-
-            JOIN dim_account AS sender
-                ON chunk.name_orig = sender.name
-
-            JOIN dim_account AS receiver
-                ON chunk.name_dest = receiver.name
+            FROM read_parquet('{source}') AS chunk
+            JOIN dim_account AS sender ON chunk.name_orig = sender.name
+            JOIN dim_account AS receiver ON chunk.name_dest = receiver.name
             """
         )
 
         total_rows += rows
 
-    logger.info(
-        "Rows inserted into fact_transactions: %s",
-        total_rows
-    )
-
+    logger.info("Rows inserted into fact_transactions: %s", total_rows)
     return total_rows
 
 
-# --------------------------------------------------
-# Main
-# --------------------------------------------------
-
-def main():
-
-    logger.info(
-        "Starting DuckDB loading"
-    )
-
-    logger.info(
-        "Database path: %s",
-        database_path
-    )
-
-    logger.info(
-        "Chunk size: %s",
-        config.chunk_size
-    )
-
-    logger.info(
-        "Max workers: %s",
-        config.max_workers
-    )
+def create_views(connection: duckdb.DuckDBPyConnection) -> None:
+    """Create the analytical views from views.sql."""
+    connection.execute(VIEWS_PATH.read_text())
+    logger.info("Views created from %s", VIEWS_PATH)
 
 
-    # ----------------------------------------------
-    # Create database and load schema
-    # ----------------------------------------------
-
-    connection = create_database()
-
-
-    # ----------------------------------------------
-    # Load dimensions
-    # ----------------------------------------------
-
-    load_transaction_types(
-        connection
-    )
-
-    load_accounts(
-        connection
-    )
-
-    load_time(
-        connection
-    )
-
-
-    # ----------------------------------------------
-    # Load complaints
-    # ----------------------------------------------
-
-    load_complaints(
-        connection
-    )
-
-
-    # ----------------------------------------------
-    # Create transaction chunks
-    # ----------------------------------------------
-
-    chunks = create_chunks(
-        parquet_path,
-        config.chunk_size
-    )
-
-
-    # ----------------------------------------------
-    # Close parent connection
-    # ----------------------------------------------
-
-    connection.close()
-
-
-    # ----------------------------------------------
-    # Prepare worker arguments
-    # ----------------------------------------------
-
-    arguments = []
-
-    for start, end in chunks:
-
-        arguments.append(
-            (
-                str(parquet_path),
-                start,
-                end
-            )
-        )
-
-
-    # ----------------------------------------------
-    # Process chunks in parallel
-    # ----------------------------------------------
-
-    logger.info(
-        "Starting ProcessPoolExecutor with %s workers",
-        config.max_workers
-    )
-
-    with ProcessPoolExecutor(
-        max_workers=config.max_workers
-    ) as executor:
-
-        temp_files = list(
-            executor.map(
-                process_chunk,
-                arguments
-            )
-        )
-
-
-    logger.info(
-        "Parallel chunk processing completed"
-    )
-
-
-    # ----------------------------------------------
-    # Open DuckDB for final insertion
-    # ----------------------------------------------
-
-    connection = duckdb.connect(
-        str(database_path)
-    )
-
-    connection.execute(
-        "PRAGMA enable_progress_bar=false"
-    )
-
-
-    # ----------------------------------------------
-    # Insert all processed chunks
-    # ----------------------------------------------
-
-    total_rows = insert_chunks(
-        connection,
-        temp_files
-    )
-
-
-    # ----------------------------------------------
-    # Verify final row count
-    # ----------------------------------------------
-
-    database_rows = connection.execute(
-        """
-        SELECT COUNT(*)
-        FROM fact_transactions
-        """
+def verify_row_count(connection: duckdb.DuckDBPyConnection) -> None:
+    """Check the fact table matches the source Parquet row for row."""
+    loaded = connection.execute("SELECT COUNT(*) FROM fact_transactions").fetchone()[0]
+    expected = connection.execute(
+        f"SELECT COUNT(*) FROM read_parquet('{TRANSACTIONS_PATH.as_posix()}')"
     ).fetchone()[0]
 
-    logger.info(
-        "Final fact_transactions row count: %s",
-        database_rows
+    logger.info("Final fact_transactions row count: %s", loaded)
+
+    if loaded != expected:
+        raise ValueError(
+            f"Row count mismatch: loaded {loaded}, source has {expected}"
+        )
+
+    logger.info("Row count matches the source Parquet")
+
+
+def parse_arguments() -> argparse.Namespace:
+    """Parse the command line arguments."""
+    parser = argparse.ArgumentParser(description="Load FinFlow data into DuckDB.")
+    parser.add_argument(
+        "--reload",
+        action="store_true",
+        help="drop and recreate the tables instead of truncating them",
     )
+    return parser.parse_args()
 
 
-    # ----------------------------------------------
-    # Run data quality checks
-    # ----------------------------------------------
+def main() -> None:
+    """Load every table, create the views, and run the quality checks."""
+    arguments = parse_arguments()
 
-    logger.info(
-        "Starting data quality checks"
-    )
+    logger.info("Starting DuckDB loading")
+    logger.info("Database path: %s", DATABASE_PATH)
+    logger.info("Chunk size: %s", CONFIG.chunk_size)
+    logger.info("Max workers: %s", CONFIG.max_workers)
 
-    run_quality_checks(
-        connection
-    )
+    if not TRANSACTIONS_PATH.is_file():
+        raise FileNotFoundError(
+            f"Transformed transactions not found: {TRANSACTIONS_PATH}. "
+            "Run the transformation stage first."
+        )
 
-    logger.info(
-        "Data quality checks passed"
-    )
+    connection = open_database()
+    temp_files: list[str] = []
 
+    try:
+        create_tables(connection, reload=arguments.reload)
+        truncate_tables(connection)
 
-    # ----------------------------------------------
-    # Close database
-    # ----------------------------------------------
+        load_transaction_types(connection)
+        load_accounts(connection)
+        load_time(connection)
+        load_complaints(connection)
 
-    connection.close()
+        type_map = transaction_type_map(connection)
+        chunks = create_chunks(connection, CONFIG.chunk_size)
 
+        # The workers open their own connections, so the parent one has to be
+        # closed while they run -- DuckDB allows a single writer per file.
+        connection.close()
 
-    # ----------------------------------------------
-    # Delete temporary files
-    # ----------------------------------------------
+        arguments_list = [
+            (
+                TRANSACTIONS_PATH.as_posix(),
+                start_id,
+                end_id,
+                type_map,
+                str(PROCESSED_DIR),
+            )
+            for start_id, end_id in chunks
+        ]
 
-    for temp_file in temp_files:
+        logger.info("Starting ProcessPoolExecutor with %s workers", CONFIG.max_workers)
 
-        Path(
-            temp_file
-        ).unlink()
+        with ProcessPoolExecutor(max_workers=CONFIG.max_workers) as executor:
+            temp_files = list(executor.map(process_chunk, arguments_list))
 
+        logger.info("Parallel chunk processing completed")
 
-    # ----------------------------------------------
-    # Final result
-    # ----------------------------------------------
+        connection = open_database()
+        total_rows = insert_chunks(connection, temp_files)
 
-    logger.info(
-        "Total rows inserted: %s",
-        total_rows
-    )
+        verify_row_count(connection)
+        create_views(connection)
 
-    logger.info(
-        "DuckDB loading completed"
-    )
+        logger.info("Starting data quality checks")
+        run_quality_checks(connection)
 
+        logger.info("Total rows inserted: %s", total_rows)
+        logger.info("DuckDB loading completed")
 
-# --------------------------------------------------
-# Run program
-# --------------------------------------------------
+    finally:
+        connection.close()
+
+        for temp_file in temp_files:
+            Path(temp_file).unlink(missing_ok=True)
+
 
 if __name__ == "__main__":
-
     main()

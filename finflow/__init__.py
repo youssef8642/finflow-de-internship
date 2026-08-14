@@ -1,1 +1,1 @@
-"""Finflow package."""
+"""FinFlow data engineering pipeline."""

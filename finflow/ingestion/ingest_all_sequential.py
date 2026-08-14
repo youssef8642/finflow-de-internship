@@ -1,37 +1,35 @@
-"""Sequential ingestion for the PaySim dataset."""
+"""Sequential ingestion for the three FinFlow source datasets.
+
+Ingestion is deliberately thin. Each function does four things and no more:
+read the source, check the columns are the ones we expect, rename them to
+snake_case, and write Parquet. Type coercion and derived columns belong to
+the transformation stage (transform_parallel.py), not here.
+"""
 
 from __future__ import annotations
 
-import os
-import sys
 import time
 from pathlib import Path
 
 import duckdb
 import pandas as pd
-import requests
-from dotenv import load_dotenv
 from fredapi import Fred
-from requests.adapters import HTTPAdapter, Retry
 
-# Project root directory
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
-
-# Allow imports from the project root
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
-
-# Project configuration and logging
 from finflow.config.logger import get_logger
 from finflow.config.settings import PipelineConfig
 
 
 logger = get_logger(__name__)
 
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+CONFIG = PipelineConfig()
+
+RAW_DIR = PROJECT_ROOT / CONFIG.raw_dir
+PROCESSED_DIR = PROJECT_ROOT / CONFIG.processed_dir
+
+# PaySim ships camelCase headers. Only the columns that actually change are
+# listed -- step, type and amount are already snake_case.
 PAYSIM_COLUMN_RENAMES = {
-    "step": "step",
-    "type": "type",
-    "amount": "amount",
     "nameOrig": "name_orig",
     "oldbalanceOrg": "old_balance_org",
     "newbalanceOrig": "new_balance_org",
@@ -42,447 +40,221 @@ PAYSIM_COLUMN_RENAMES = {
     "isFlaggedFraud": "is_flagged_fraud",
 }
 
-REQUIRED_RAW_COLUMNS = list(PAYSIM_COLUMN_RENAMES.keys())
+# Plain numpy dtypes on purpose. pandas' nullable Int64/Float64 parse several
+# times slower and PaySim has no missing values for them to represent.
+PAYSIM_DTYPES = {
+    "step": "int64",
+    "type": "str",
+    "amount": "float64",
+    "nameOrig": "str",
+    "oldbalanceOrg": "float64",
+    "newbalanceOrig": "float64",
+    "nameDest": "str",
+    "oldbalanceDest": "float64",
+    "newbalanceDest": "float64",
+    "isFraud": "int64",
+    "isFlaggedFraud": "int64",
+}
 
-CONTROL_CHAR_PATTERN = r"[\x00-\x1f\x7f]"
+FRED_SERIES = ("CPIAUCSL", "UNRATE", "DEXUSEU")
 
+# The CFPB export is ~9 GB and 16 columns wide. We only model 8 of them, so
+# reading just those keeps the whole file out of memory.
+COMPLAINT_COLUMNS = [
+    "Complaint ID",
+    "Date received",
+    "Product",
+    "Sub-product",
+    "Issue",
+    "Company",
+    "State",
+    "Company response to consumer",
+]
 
+COMPLAINT_PRODUCTS = ["Checking or savings account", "Credit card"]
+
+COMPLAINT_CHUNK_SIZE = 100_000
 
 
 class IngestionError(Exception):
     """Raised when an ingestion process fails."""
 
-def ingest_paysim() -> Path:
-    """Load, validate, clean, and store the PaySim dataset."""
 
+def _write_parquet(df: pd.DataFrame, output_path: Path) -> None:
+    """Write a DataFrame to Parquet through DuckDB."""
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # as_posix() matters on Windows: backslashes inside a single-quoted SQL
+    # string get read as escape sequences.
+    sql_path = output_path.as_posix().replace("'", "''")
+
+    with duckdb.connect(database=":memory:") as connection:
+        connection.execute("PRAGMA enable_progress_bar=false")
+        connection.register("frame_to_write", df)
+        connection.execute(f"COPY frame_to_write TO '{sql_path}' (FORMAT PARQUET)")
+
+
+def _validate_paysim(df: pd.DataFrame) -> None:
+    """Check the raw PaySim frame has the expected columns and dtypes."""
+    missing = [column for column in PAYSIM_DTYPES if column not in df.columns]
+    if missing:
+        raise ValueError("Missing required columns: " + ", ".join(missing))
+
+    # "str" reads back as a string dtype whose name varies by pandas version,
+    # so compare the numeric columns only.
+    for column, expected in PAYSIM_DTYPES.items():
+        if expected == "str":
+            continue
+        actual = str(df[column].dtype)
+        if actual != expected:
+            raise ValueError(
+                f"Column {column} has dtype {actual}, expected {expected}"
+            )
+
+
+def ingest_paysim() -> Path:
+    """Read the PaySim CSV, rename its columns, and save it as Parquet."""
     start = time.perf_counter()
     logger.info("Starting PaySim ingestion")
 
     try:
-        config = PipelineConfig()
-
-        raw_dir = PROJECT_ROOT / config.raw_dir
-        processed_dir = PROJECT_ROOT / config.processed_dir
-
-        source_path = raw_dir / "paysim.csv"
-        output_path = processed_dir / "transactions.parquet"
+        source_path = RAW_DIR / "paysim.csv"
+        output_path = PROCESSED_DIR / "transactions.parquet"
 
         if not source_path.is_file():
-            raise FileNotFoundError(
-                f"PaySim file not found: {source_path}"
-            )
+            raise FileNotFoundError(f"PaySim file not found: {source_path}")
 
-        logger.info(
-            "Reading PaySim CSV from %s",
-            source_path,
-        )
+        logger.info("Reading PaySim CSV from %s", source_path)
+        transactions = pd.read_csv(source_path, dtype=PAYSIM_DTYPES)
 
-        dtype = {
-            "step": "Int64",
-            "type": "string",
-            "amount": "Float64",
-            "nameOrig": "string",
-            "oldbalanceOrg": "Float64",
-            "newbalanceOrig": "Float64",
-            "nameDest": "string",
-            "oldbalanceDest": "Float64",
-            "newbalanceDest": "Float64",
-            "isFraud": "Int64",
-            "isFlaggedFraud": "Int64",
-        }
+        _validate_paysim(transactions)
+        transactions = transactions.rename(columns=PAYSIM_COLUMN_RENAMES)
 
-        transactions = pd.read_csv(
-            source_path,
-            dtype=dtype,
-            low_memory=False,
-        )
-
-        # Clean only the string columns.
-        for column in ["type", "nameOrig", "nameDest"]:
-            transactions[column] = (
-                transactions[column]
-                .str.replace(
-                    CONTROL_CHAR_PATTERN,
-                    "",
-                    regex=True,
-                )
-                .str.strip()
-            )
-
-        # Remove completely empty rows.
-        transactions = transactions.dropna(how="all")
-
-        # Validate required columns.
-        missing_columns = [
-            column
-            for column in REQUIRED_RAW_COLUMNS
-            if column not in transactions.columns
-        ]
-
-        if missing_columns:
-            raise ValueError(
-                "Missing required columns: "
-                + ", ".join(missing_columns)
-            )
-
-        # Rename PaySim columns to snake_case.
-        transactions = transactions.rename(
-            columns=PAYSIM_COLUMN_RENAMES
-        )
-
-        logger.info(
-            "PaySim row count: %s",
-            len(transactions),
-        )
-
-        logger.info(
-            "Writing %s rows to %s",
-            len(transactions),
-            output_path,
-        )
-
-        output_path.parent.mkdir(
-            parents=True,
-            exist_ok=True,
-        )
-
-        connection = duckdb.connect(
-            database=":memory:"
-        )
-
-        try:
-            connection.register(
-                "transactions_df",
-                transactions,
-            )
-
-            sql_path = str(
-                output_path
-            ).replace("'", "''")
-
-            connection.execute(
-                f"""
-                COPY transactions_df
-                TO '{sql_path}'
-                (FORMAT PARQUET)
-                """
-            )
-
-        finally:
-            connection.close()
+        logger.info("PaySim row count: %s", len(transactions))
+        logger.info("Writing %s rows to %s", len(transactions), output_path)
+        _write_parquet(transactions, output_path)
 
         elapsed = time.perf_counter() - start
-
-        logger.info(
-            "PaySim ingestion completed in %.2f seconds",
-            elapsed,
-        )
-
+        logger.info("PaySim ingestion completed in %.2f seconds", elapsed)
         return output_path
 
     except Exception as exc:
-        logger.error(
-            "PaySim ingestion failed: %s",
-            exc,
-        )
-        raise IngestionError(
-            "PaySim ingestion failed"
-        ) from exc
-    
+        logger.error("PaySim ingestion failed: %s", exc)
+        raise IngestionError("PaySim ingestion failed") from exc
+
 
 def ingest_fred() -> Path:
-    """Fetch FRED economic indicators and save them as CSV files."""
-
-    start_time = time.perf_counter()
-
+    """Fetch the FRED macro indicators and save each series as a CSV."""
+    start = time.perf_counter()
     logger.info("Starting FRED ingestion")
 
     try:
-        load_dotenv()
-
-        raw_macro_dir = (
-            PROJECT_ROOT
-            / "data"
-            / "raw"
-            / "macro"
-        )
-
-        raw_macro_dir.mkdir(
-            parents=True,
-            exist_ok=True,
-        )
-
-        api_key = os.getenv("FRED_API_KEY")
-
+        api_key = CONFIG.fred_api_key
         if not api_key:
-            raise ValueError(
-                "FRED_API_KEY is not set."
-            )
+            raise ValueError("fred_api_key is not set in PipelineConfig.")
 
-        fred = Fred(
-            api_key=api_key
-        )
+        macro_dir = RAW_DIR / "macro"
+        macro_dir.mkdir(parents=True, exist_ok=True)
 
-        cpi = fred.get_series(
-            "CPIAUCSL"
-        )
+        fred = Fred(api_key=api_key)
+        total_rows = 0
 
-        unemployment = fred.get_series(
-            "UNRATE"
-        )
+        for series_id in FRED_SERIES:
+            series = fred.get_series(series_id)
+            series.to_csv(macro_dir / f"{series_id}.csv")
 
-        fx_rate = fred.get_series(
-            "DEXUSEU"
-        )
+            total_rows += len(series)
+            logger.info("FRED %s rows: %s", series_id, len(series))
 
-        cpi.to_csv(
-            raw_macro_dir / "CPIAUCSL.csv"
-        )
+        logger.info("FRED total rows: %s", total_rows)
+        logger.info("FRED data saved to %s", macro_dir)
 
-        unemployment.to_csv(
-            raw_macro_dir / "UNRATE.csv"
-        )
-
-        fx_rate.to_csv(
-            raw_macro_dir / "DEXUSEU.csv"
-        )
-
-        logger.info(
-            "FRED CPIAUCSL rows: %s",
-            len(cpi),
-        )
-
-        logger.info(
-            "FRED UNRATE rows: %s",
-            len(unemployment),
-        )
-
-        logger.info(
-            "FRED DEXUSEU rows: %s",
-            len(fx_rate),
-        )
-
-        logger.info(
-            "FRED total rows: %s",
-            len(cpi) + len(unemployment) + len(fx_rate),
-        )
-
-        logger.info(
-            "FRED data saved to %s",
-            raw_macro_dir,
-        )
-
-        elapsed = (
-            time.perf_counter()
-            - start_time
-        )
-
-        logger.info(
-            "FRED ingestion completed in %.2f seconds",
-            elapsed,
-        )
-
-        return raw_macro_dir
+        elapsed = time.perf_counter() - start
+        logger.info("FRED ingestion completed in %.2f seconds", elapsed)
+        return macro_dir
 
     except Exception as exc:
-        logger.error(
-            "FRED ingestion failed: %s",
-            exc,
-        )
-
-        raise IngestionError(
-            "FRED ingestion failed"
-        ) from exc
-
-
-def _write_parquet(
-    df: pd.DataFrame,
-    output_path: Path,
-) -> None:
-    """Write a DataFrame to Parquet through DuckDB."""
-
-    output_path.parent.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
-
-    connection = duckdb.connect(
-        database=":memory:"
-    )
-
-    try:
-        connection.register(
-            "frame_to_write",
-            df,
-        )
-
-        sql_path = (
-            output_path
-            .as_posix()
-            .replace("'", "''")
-        )
-
-        connection.execute(
-            f"COPY frame_to_write "
-            f"TO '{sql_path}' "
-            f"(FORMAT PARQUET)"
-        )
-
-    finally:
-        connection.close()
+        logger.error("FRED ingestion failed: %s", exc)
+        raise IngestionError("FRED ingestion failed") from exc
 
 
 def ingest_complaints() -> Path:
-    """Fetch CFPB complaints data and save it as a Parquet file."""
-
-    start_time = time.perf_counter()
-
-    logger.info(
-        "Starting CFPB complaints ingestion"
-    )
-
-    config = PipelineConfig()
-
-    raw_dir = PROJECT_ROOT / config.raw_dir
-    processed_dir = PROJECT_ROOT / config.processed_dir
-
-    source_path = raw_dir / "complaints.csv"
-    output_path = processed_dir / "complaints.parquet"
-
-    if not source_path.is_file():
-        raise FileNotFoundError(
-            f"Complaints file not found: {source_path}"
-        )
-
-    logger.info(
-        "Reading Complaints CSV from %s",
-        source_path,
-    )
-
-    chunk_size = 100_000
-    filtered_chunks = []
-    total_rows = 0
-    filtered_rows = 0
-    chunk_number = 0
-
-    for complaints in pd.read_csv(
-        source_path,
-        low_memory=False,
-        chunksize=chunk_size,
-    ):
-        chunk_number += 1
-        total_rows += len(complaints)
-
-        complaints = complaints[
-            complaints["Product"].isin(
-                [
-                    "Checking or savings account",
-                    "Credit card",
-                ]
-            )
-        ]
-
-        filtered_rows += len(complaints)
-
-        filtered_chunks.append(complaints)
-
-        logger.info(
-            "Processed chunk %s | Rows read: %s | Rows kept: %s",
-            chunk_number,
-            total_rows,
-            filtered_rows,
-        )
-
-    complaints = pd.concat(
-        filtered_chunks,
-        ignore_index=True,
-    )
-
-    logger.info(
-        "CFPB complaints row count before filtering: %s",
-        total_rows,
-    )
-
-    logger.info(
-        "CFPB complaints row count after filtering: %s",
-        filtered_rows,
-    )
-
-    logger.info(
-        "Writing %s rows to %s",
-        len(complaints),
-        output_path,
-    )
-
-    _write_parquet(
-        complaints,
-        output_path,
-    )
-
-    elapsed_time = time.perf_counter() - start_time
-
-    logger.info(
-        "CFPB complaints ingestion completed in %.2f seconds",
-        elapsed_time,
-    )
-
-    return output_path
-
-
-def run_sequential() -> None:
-    """Run all ingestion processes sequentially."""
-
-    start_time = time.perf_counter()
-
-    logger.info(
-        "Starting sequential ingestion pipeline"
-    )
+    """Filter the CFPB complaints export down to two products and save it."""
+    start = time.perf_counter()
+    logger.info("Starting CFPB complaints ingestion")
 
     try:
-        paysim_output = ingest_paysim()
+        source_path = RAW_DIR / "complaints.csv"
+        output_path = PROCESSED_DIR / "complaints.parquet"
 
-        logger.info(
-            "PaySim ingestion complete: %s",
-            paysim_output,
+        if not source_path.is_file():
+            raise FileNotFoundError(f"Complaints file not found: {source_path}")
+
+        logger.info("Reading complaints CSV from %s", source_path)
+
+        kept_chunks = []
+        total_rows = 0
+        kept_rows = 0
+
+        reader = pd.read_csv(
+            source_path,
+            usecols=COMPLAINT_COLUMNS,
+            chunksize=COMPLAINT_CHUNK_SIZE,
+            low_memory=False,
         )
 
-        fred_output = ingest_fred()
+        for chunk_number, chunk in enumerate(reader, start=1):
+            total_rows += len(chunk)
 
-        logger.info(
-            "FRED ingestion complete: %s",
-            fred_output,
-        )
+            chunk = chunk[chunk["Product"].isin(COMPLAINT_PRODUCTS)]
+            kept_rows += len(chunk)
+            kept_chunks.append(chunk)
+
+            if chunk_number % 10 == 0:
+                logger.info(
+                    "Chunk %s | rows read: %s | rows kept: %s",
+                    chunk_number,
+                    total_rows,
+                    kept_rows,
+                )
+
+        complaints = pd.concat(kept_chunks, ignore_index=True)
+
+        logger.info("Complaint rows before filtering: %s", total_rows)
+        logger.info("Complaint rows after filtering: %s", kept_rows)
+        logger.info("Writing %s rows to %s", len(complaints), output_path)
+        _write_parquet(complaints, output_path)
+
+        elapsed = time.perf_counter() - start
+        logger.info("CFPB complaints ingestion completed in %.2f seconds", elapsed)
+        return output_path
+
+    except Exception as exc:
+        logger.error("CFPB complaints ingestion failed: %s", exc)
+        raise IngestionError("CFPB complaints ingestion failed") from exc
 
 
-        complaints_output = ingest_complaints()
+def run_sequential() -> float:
+    """Run all three ingestion functions in order and return the elapsed time."""
+    start = time.perf_counter()
+    logger.info("Starting sequential ingestion pipeline")
 
-        logger.info(
-            "CFPB complaints ingestion complete: %s",
-            complaints_output,
-        )
+    try:
+        logger.info("PaySim ingestion complete: %s", ingest_paysim())
+        logger.info("FRED ingestion complete: %s", ingest_fred())
+        logger.info("CFPB complaints ingestion complete: %s", ingest_complaints())
 
-    except Exception:
-        logger.error(
-            "Sequential ingestion pipeline failed"
-        )
+    except IngestionError:
+        logger.error("Sequential ingestion pipeline failed")
         raise
 
-    finally:
-        elapsed = (
-            time.perf_counter()
-            - start_time
-        )
-
-        logger.info(
-            "Sequential ingestion pipeline completed in %.2f seconds",
-            elapsed,
-        )
-
+    elapsed = time.perf_counter() - start
+    logger.info("Sequential ingestion pipeline completed in %.2f seconds", elapsed)
+    return elapsed
 
 
 def main() -> None:
     """Run the sequential ingestion pipeline."""
-
     run_sequential()
 
 

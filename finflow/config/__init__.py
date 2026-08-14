@@ -1,1 +1,1 @@
-"""Configuration utilities for Finflow."""
+"""FinFlow configuration package."""

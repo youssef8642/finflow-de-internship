@@ -1,4 +1,6 @@
 pandas
+numpy
+scipy
 duckdb
 requests
 fredapi
@@ -6,4 +8,3 @@ matplotlib
 seaborn
 pylint
 pytest
-python-dotenv

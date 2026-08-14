@@ -50,54 +50,13 @@ If your system uses the Windows Python launcher, you can replace `python` with `
 - Generated files such as `.venv/`, `__pycache__/`, and local databases are ignored by Git.
 - The prereq scripts are meant to be run from the repository root.
 - The project is still a scaffold, so several package folders are intentionally empty
+- `finflow/detection/` and `finflow/presentation/` are placeholders for Week 4.
 
+## Environment Variables
 
-env file contents:FRED_API_KEY=cfaf9d1c396769e0e721088fee194288 
+Create a `.env` file in the project root with your own FRED API key:
 
-(.venv) C:\Users\Youss\finflow-de-internship>py -m finflow.ingestion.ingest_all_sequential
-2026-08-05 15:18:17 | INFO | __main__ | Starting sequential ingestion pipeline
-2026-08-05 15:18:17 | INFO | __main__ | Starting PaySim ingestion
-2026-08-05 15:18:17 | INFO | __main__ | Reading PaySim CSV from C:\Users\Youss\finflow-de-internship\data\raw\paysim.csv
-2026-08-05 15:20:41 | INFO | __main__ | PaySim row count: 6362620
-2026-08-05 15:20:41 | INFO | __main__ | Writing 6362620 rows to C:\Users\Youss\finflow-de-internship\data\processed\transactions.parquet
-2026-08-05 15:20:45 | INFO | __main__ | PaySim ingestion completed in 148.45 seconds
-2026-08-05 15:20:46 | INFO | __main__ | PaySim ingestion complete: C:\Users\Youss\finflow-de-internship\data\processed\transactions.parquet
-2026-08-05 15:20:46 | INFO | __main__ | Starting FRED ingestion
-2026-08-05 15:20:50 | INFO | __main__ | FRED CPIAUCSL rows: 954
-2026-08-05 15:20:50 | INFO | __main__ | FRED UNRATE rows: 942
-2026-08-05 15:20:50 | INFO | __main__ | FRED DEXUSEU rows: 7195
-2026-08-05 15:20:50 | INFO | __main__ | FRED total rows: 9091
-2026-08-05 15:20:50 | INFO | __main__ | FRED data saved to C:\Users\Youss\finflow-de-internship\data\raw\macro
-2026-08-05 15:20:50 | INFO | __main__ | FRED ingestion completed in 4.54 seconds
-2026-08-05 15:20:50 | INFO | __main__ | FRED ingestion complete: C:\Users\Youss\finflow-de-internship\data\raw\macro
-2026-08-05 15:20:50 | INFO | __main__ | Starting CFPB complaints ingestion
-2026-08-05 15:20:51 | INFO | __main__ | Downloaded 1000 CFPB complaints
-2026-08-05 15:20:52 | INFO | __main__ | Downloaded 2000 CFPB complaints
-2026-08-05 15:20:53 | INFO | __main__ | Downloaded 3000 CFPB complaints
-2026-08-05 15:20:53 | INFO | __main__ | Downloaded 4000 CFPB complaints
-2026-08-05 15:20:54 | INFO | __main__ | Downloaded 5000 CFPB complaints
-2026-08-05 15:20:56 | INFO | __main__ | Downloaded 6000 CFPB complaints
-2026-08-05 15:20:56 | INFO | __main__ | Downloaded 7000 CFPB complaints
-2026-08-05 15:20:57 | INFO | __main__ | Downloaded 8000 CFPB complaints
-2026-08-05 15:20:57 | INFO | __main__ | Downloaded 9000 CFPB complaints
-2026-08-05 15:20:58 | INFO | __main__ | Downloaded 10000 CFPB complaints
-2026-08-05 15:20:59 | INFO | __main__ | Downloaded 11000 CFPB complaints
-2026-08-05 15:20:59 | INFO | __main__ | Downloaded 12000 CFPB complaints
-2026-08-05 15:21:00 | INFO | __main__ | Downloaded 13000 CFPB complaints
-2026-08-05 15:21:00 | INFO | __main__ | Downloaded 14000 CFPB complaints
-2026-08-05 15:21:01 | INFO | __main__ | Downloaded 15000 CFPB complaints
-2026-08-05 15:21:02 | INFO | __main__ | Downloaded 16000 CFPB complaints
-2026-08-05 15:21:03 | INFO | __main__ | Downloaded 17000 CFPB complaints
-2026-08-05 15:21:04 | INFO | __main__ | Downloaded 18000 CFPB complaints
-2026-08-05 15:21:05 | INFO | __main__ | Downloaded 19000 CFPB complaints
-2026-08-05 15:21:05 | INFO | __main__ | Downloaded 20000 CFPB complaints
-2026-08-05 15:21:05 | INFO | __main__ | CFPB complaint row count: 20000
-2026-08-05 15:21:05 | INFO | __main__ | Writing 20000 CFPB complaints to C:\Users\Youss\finflow-de-internship\data\processed\complaints.parquet
-2026-08-05 15:21:05 | INFO | __main__ | CFPB complaints ingestion completed in 15.16 seconds
-2026-08-05 15:21:05 | INFO | __main__ | CFPB complaints ingestion complete: C:\Users\Youss\finflow-de-internship\data\processed\complaints.parquet
-2026-08-05 15:21:05 | INFO | __main__ | Sequential ingestion pipeline completed in 168.48 seconds
+```
+FRED_API_KEY=cfaf9d1c396769e0e721088fee194288
+```
 
-
-
-CFPB was only conducted on 20,000  records for trial purposes ,not the whole dataset
-for future uses,to conduct on full dataset,max limit variable will be removed,and timeout variable will be incremented accordingly
