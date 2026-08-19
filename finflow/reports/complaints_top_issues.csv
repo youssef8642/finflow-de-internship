@@ -1,0 +1,11 @@
+product,issue_rank,issue,complaint_count
+Checking or savings account,1,Managing an account,225374
+Checking or savings account,2,Closing an account,49613
+Checking or savings account,3,Problem with a lender or other company charging your account,42884
+Checking or savings account,4,Opening an account,35533
+Checking or savings account,5,Problem caused by your funds being low,29776
+Credit card,1,Problem with a purchase shown on your statement,57630
+Credit card,2,Incorrect information on your report,31937
+Credit card,3,Getting a credit card,30125
+Credit card,4,Problem with a company's investigation into an existing problem,26284
+Credit card,5,"Other features, terms, or problems",24341

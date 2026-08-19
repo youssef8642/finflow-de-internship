@@ -1,15 +1,11 @@
-"""Configuration shared by every pipeline stage."""
+"""Milestone 1.1 - configuration object shared by every pipeline stage."""
 
 from dataclasses import dataclass
 
 
 @dataclass
 class PipelineConfig:
-    """Paths, credentials, and tuning knobs for the FinFlow pipeline.
-
-    Paths are relative to the project root; each module resolves them against
-    its own PROJECT_ROOT so the scripts work from any directory.
-    """
+    """Paths and settings for the pipeline. Paths are relative to the repo root."""
 
     raw_dir: str = "data/raw"
     processed_dir: str = "data/processed"

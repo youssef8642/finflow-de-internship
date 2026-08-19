@@ -35,7 +35,7 @@ def fetch_sequential(urls):
 
     for url in urls:
         response = requests.get(url)
-        sizes.append(len(response.content))  # bytes
+        sizes.append(len(response.content))
     return sizes
 
 
@@ -203,7 +203,3 @@ if __name__ == "__main__":
 
     if seq_results != par_results:
         logger.warning("Sequential and parallel results differ.")
-
-# ThreadPoolExecutor works well in Part A because the requests spend most of their time waiting on network I/O instead of using the CPU.
-# That waiting time lets other threads run, so the total download time drops even though the work is still done in one Python process.
-# Part B is CPU-bound, so the Global Interpreter Lock (GIL) keeps only one thread executing Python bytecode at a time, which is why ProcessPoolExecutor is needed to use multiple cores.

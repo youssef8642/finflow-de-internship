@@ -1,1301 +1,281 @@
-import duckdb
-import pandas as pd
-import matplotlib.pyplot as plt
+"""Milestone 3.2 - Fraud prevalence and statistical analysis.
 
-from pathlib import Path
+Order of this file follows the milestone bullets:
+    1. summary table (overall rate, rate by type, amount stats, zero balances)
+    2. z-score analysis with a box plot
+    3. conditional probability table, written in DuckDB SQL
+    4. Bayes' theorem applied to the R01 proxy
+"""
+
+import duckdb
+import matplotlib.pyplot as plt
+import pandas as pd
 
 from finflow.config.logger import get_logger
-
-
-# ---------------------------------------------------------------------
-# Configuration
-# ---------------------------------------------------------------------
-
-DB_PATH = "data/finflow.duckdb"
-REPORTS_DIR = Path(__file__).resolve().parents[1] / "reports"
-
-SUMMARY_PATH = REPORTS_DIR / "fraud_summary.csv"
-ZSCORE_PLOT_PATH = REPORTS_DIR / "fraud_zscore_boxplot.png"
-NOTES_PATH = REPORTS_DIR / "fraud_analysis_notes.md"
+from finflow.config.settings import PipelineConfig
 
 logger = get_logger(__name__)
+config = PipelineConfig()
+
+REPORTS_DIR = "finflow/reports"
 
 
-def get_connection():
-    connection = duckdb.connect(DB_PATH)
-
-    connection.execute(
-        "PRAGMA enable_progress_bar=false"
-    )
-
-    return connection
+def run_query(sql: str):
+    """Run one query and return a DataFrame."""
+    connection = duckdb.connect(config.db_path)
+    result = connection.execute(sql).fetchdf()
+    connection.close()
+    return result
 
 
-# ---------------------------------------------------------------------
-# 1. Overall fraud percentage
-# ---------------------------------------------------------------------
+def overall_fraud_rate():
+    """Overall fraud rate across every transaction."""
+    return run_query("""
+        SELECT
+            COUNT(*) AS total_transactions,
+            SUM(CASE WHEN is_fraud THEN 1 ELSE 0 END) AS fraud_transactions,
+            100.0 * SUM(CASE WHEN is_fraud THEN 1 ELSE 0 END) / COUNT(*) AS fraud_rate
+        FROM fact_transactions
+    """)
 
-def get_fraud_percentage():
-    connection = get_connection()
 
-    try:
-        result = connection.execute(
-            """
+def fraud_rate_by_type():
+    """P(fraud | transaction_type) for each transaction type."""
+    return run_query("""
+        SELECT
+            tt.type_name,
+            COUNT(*) AS total_transactions,
+            SUM(CASE WHEN f.is_fraud THEN 1 ELSE 0 END) AS fraud_transactions,
+            100.0 * SUM(CASE WHEN f.is_fraud THEN 1 ELSE 0 END) / COUNT(*) AS fraud_rate
+        FROM fact_transactions AS f
+        JOIN dim_transaction_type AS tt ON f.transaction_type_id = tt.id
+        GROUP BY tt.type_name
+        ORDER BY fraud_rate DESC
+    """)
+
+
+def amount_statistics():
+    """Mean, median and 95th percentile of amount, fraud vs non-fraud."""
+    return run_query("""
+        SELECT
+            CASE WHEN is_fraud THEN 'fraud' ELSE 'non_fraud' END AS group_name,
+            AVG(amount) AS mean_amount,
+            MEDIAN(amount) AS median_amount,
+            QUANTILE_CONT(amount, 0.95) AS p95_amount
+        FROM fact_transactions
+        GROUP BY is_fraud
+        ORDER BY group_name
+    """)
+
+
+def zero_balance_rates():
+    """Share of fraud cases where the sender or the receiver balance is 0.
+
+    A receiver balance that never moves is a well known money laundering
+    pattern: the money arrives and is swept straight out again.
+    """
+    return run_query("""
+        SELECT
+            100.0 * SUM(CASE WHEN new_balance_sender = 0 THEN 1 ELSE 0 END) / COUNT(*)
+                AS pct_sender_zero,
+            100.0 * SUM(CASE WHEN new_balance_receiver = 0 THEN 1 ELSE 0 END) / COUNT(*)
+                AS pct_receiver_zero
+        FROM fact_transactions
+        WHERE is_fraud = TRUE
+    """)
+
+
+def fraud_z_scores():
+    """Z-score of each fraudulent amount, measured inside its own type.
+
+    The mean and standard deviation come from all transactions of that type,
+    not only the fraudulent ones, because that is the population a detection
+    rule would compare a new transaction against.
+    """
+    return run_query("""
+        WITH type_stats AS (
             SELECT
-                COUNT(*) FILTER (
-                    WHERE is_fraud = TRUE
-                ) AS fraud_count,
-
-                COUNT(*) AS total_count
-
-            FROM fact_transactions;
-            """
-        ).fetchone()
-
-        fraud_count = result[0]
-        total_count = result[1]
-
-        fraud_percentage = (
-            fraud_count / total_count * 100
-            if total_count > 0
-            else 0
-        )
-
-        logger.info(
-            f"Fraud count: {fraud_count}, "
-            f"Total count: {total_count}"
-        )
-
-        logger.info(
-            f"Fraud percentage: "
-            f"{fraud_percentage:.2f}%"
-        )
-
-        return {
-            "fraud_count": fraud_count,
-            "total_count": total_count,
-            "fraud_percentage": fraud_percentage
-        }
-
-    finally:
-        connection.close()
-
-
-# ---------------------------------------------------------------------
-# 2. Fraud percentage by transaction type
-# ---------------------------------------------------------------------
-
-def get_fraud_percentage_by_transaction_type():
-    connection = get_connection()
-
-    try:
-        result = connection.execute(
-            """
-            SELECT
-                tt.type_name AS transaction_type,
-
-                COUNT(*) AS total_transactions,
-
-                COUNT(*) FILTER (
-                    WHERE ft.is_fraud = TRUE
-                ) AS fraud_count,
-
-                ROUND(
-                    100.0 *
-                    COUNT(*) FILTER (
-                        WHERE ft.is_fraud = TRUE
-                    )
-                    / COUNT(*),
-                    2
-                ) AS fraud_percentage
-
-            FROM fact_transactions AS ft
-
-            JOIN dim_transaction_type AS tt
-                ON ft.transaction_type_id = tt.id
-
-            GROUP BY tt.type_name
-
-            ORDER BY fraud_percentage DESC;
-            """
-        ).fetchdf()
-
-        logger.info(
-            "Fraud percentage by transaction type:"
-        )
-
-        for _, row in result.iterrows():
-            logger.info(
-                f"Transaction Type: {row['transaction_type']}, "
-                f"Total Transactions: "
-                f"{int(row['total_transactions'])}, "
-                f"Fraud Count: {int(row['fraud_count'])}, "
-                f"Fraud Percentage: "
-                f"{row['fraud_percentage']:.2f}%"
-            )
-
-        return result
-
-    finally:
-        connection.close()
-
-
-# ---------------------------------------------------------------------
-# 3. Mean, median and 95th percentile amount
-#    for fraud vs non-fraud
-# ---------------------------------------------------------------------
-
-def get_transaction_statistics_by_fraud_status():
-    connection = get_connection()
-
-    try:
-        result = connection.execute(
-            """
-            SELECT
-                CASE
-                    WHEN is_fraud = TRUE
-                        THEN 'Fraud'
-                    ELSE 'Non-Fraud'
-                END AS fraud_status,
-
-                COUNT(*) AS transaction_count,
-
-                ROUND(
-                    AVG(amount),
-                    2
-                ) AS mean_amount,
-
-                ROUND(
-                    MEDIAN(amount),
-                    2
-                ) AS median_amount,
-
-                ROUND(
-                    QUANTILE_CONT(amount, 0.95),
-                    2
-                ) AS percentile_95_amount
-
+                transaction_type_id,
+                AVG(amount) AS mean_amount,
+                STDDEV_SAMP(amount) AS sd_amount
             FROM fact_transactions
-
-            GROUP BY is_fraud
-
-            ORDER BY is_fraud DESC;
-            """
-        ).fetchdf()
-
-        logger.info(
-            "Transaction statistics by fraud status:"
+            GROUP BY transaction_type_id
         )
-
-        for _, row in result.iterrows():
-            logger.info(
-                f"Fraud Status: {row['fraud_status']}, "
-                f"Transaction Count: "
-                f"{int(row['transaction_count'])}, "
-                f"Mean Amount: "
-                f"{row['mean_amount']:.2f}, "
-                f"Median Amount: "
-                f"{row['median_amount']:.2f}, "
-                f"95th Percentile Amount: "
-                f"{row['percentile_95_amount']:.2f}"
-            )
-
-        return result
-
-    finally:
-        connection.close()
+        SELECT
+            tt.type_name,
+            (f.amount - s.mean_amount) / s.sd_amount AS z_score
+        FROM fact_transactions AS f
+        JOIN type_stats AS s ON f.transaction_type_id = s.transaction_type_id
+        JOIN dim_transaction_type AS tt ON f.transaction_type_id = tt.id
+        WHERE f.is_fraud = TRUE
+    """)
 
 
-# ---------------------------------------------------------------------
-# 4. Zero balance analysis
-# ---------------------------------------------------------------------
+def plot_z_scores(z_scores) -> None:
+    """Box plot comparing the z-score distributions across transaction types."""
+    figure, axes = plt.subplots(figsize=(10, 6))
 
-def get_zero_balance_fraud_percentage():
-    connection = get_connection()
+    type_names = sorted(z_scores["type_name"].unique())
+    values = []
+    for type_name in type_names:
+        values.append(z_scores[z_scores["type_name"] == type_name]["z_score"])
 
-    try:
-        result = connection.execute(
-            """
+    axes.boxplot(values, tick_labels=type_names)
+    axes.axhline(3, color="red", linestyle="--", label="z = 3 (rule R02 cut-off)")
+
+    axes.set_title("Z-Scores of Fraudulent Amounts by Transaction Type")
+    axes.set_xlabel("Transaction Type")
+    axes.set_ylabel("Z-score")
+    axes.legend()
+
+    figure.tight_layout()
+    figure.savefig(REPORTS_DIR + "/fraud_zscore_boxplot.png", dpi=150)
+    plt.close(figure)
+    logger.info("Saved fraud_zscore_boxplot.png")
+
+
+def conditional_probabilities():
+    """P(fraud | |balance_drain| > threshold) at four percentile cut-offs.
+
+    This is the empirical basis for rule R01. Written in SQL, not pandas,
+    because the milestone asks for it that way.
+    """
+    return run_query("""
+        WITH cutoffs AS (
             SELECT
-                COUNT(*) AS fraud_count,
-
-                COUNT(*) FILTER (
-                    WHERE new_balance_sender = 0
-                ) AS fraud_zero_sender_balance,
-
-                ROUND(
-                    100.0 *
-                    COUNT(*) FILTER (
-                        WHERE new_balance_sender = 0
-                    )
-                    / COUNT(*),
-                    2
-                ) AS pct_fraud_zero_sender_balance,
-
-                COUNT(*) FILTER (
-                    WHERE new_balance_receiver = 0
-                ) AS fraud_zero_receiver_balance,
-
-                ROUND(
-                    100.0 *
-                    COUNT(*) FILTER (
-                        WHERE new_balance_receiver = 0
-                    )
-                    / COUNT(*),
-                    2
-                ) AS pct_fraud_zero_receiver_balance
-
+                QUANTILE_CONT(ABS(balance_drain), 0.75) AS p75,
+                QUANTILE_CONT(ABS(balance_drain), 0.90) AS p90,
+                QUANTILE_CONT(ABS(balance_drain), 0.95) AS p95,
+                QUANTILE_CONT(ABS(balance_drain), 0.99) AS p99
             FROM fact_transactions
-
-            WHERE is_fraud = TRUE;
-            """
-        ).fetchone()
-
-        logger.info(
-            f"Fraud count: {result[0]}"
+        ),
+        levels AS (
+            SELECT '75th' AS level_name, p75 AS cutoff FROM cutoffs
+            UNION ALL SELECT '90th', p90 FROM cutoffs
+            UNION ALL SELECT '95th', p95 FROM cutoffs
+            UNION ALL SELECT '99th', p99 FROM cutoffs
         )
+        SELECT
+            l.level_name,
+            l.cutoff,
+            COUNT(*) AS transactions_above,
+            SUM(CASE WHEN f.is_fraud THEN 1 ELSE 0 END) AS fraud_above,
+            100.0 * SUM(CASE WHEN f.is_fraud THEN 1 ELSE 0 END) / COUNT(*) AS fraud_probability
+        FROM fact_transactions AS f
+        JOIN levels AS l ON ABS(f.balance_drain) > l.cutoff
+        GROUP BY l.level_name, l.cutoff
+        ORDER BY l.cutoff
+    """)
 
-        logger.info(
-            f"Fraud with zero sender balance: "
-            f"{result[1]} ({result[2]:.2f}%)"
+
+def bayes_for_r01():
+    """Posterior probability that a transaction is fraud once R01 fires.
+
+    R01 proxy: new_balance_sender = 0 AND amount > median amount.
+
+    Bayes' theorem:
+
+        P(fraud | R01) = P(R01 | fraud) * P(fraud) / P(R01)
+
+    The three inputs are counted in SQL, then the formula is applied below
+    and checked against the direct count of P(fraud | R01).
+    """
+    counts = run_query("""
+        WITH median_amount AS (
+            SELECT MEDIAN(amount) AS value FROM fact_transactions
         )
+        SELECT
+            COUNT(*) AS total,
+            SUM(CASE WHEN f.is_fraud THEN 1 ELSE 0 END) AS fraud,
+            SUM(CASE WHEN f.new_balance_sender = 0 AND f.amount > m.value
+                     THEN 1 ELSE 0 END) AS r01_fired,
+            SUM(CASE WHEN f.is_fraud AND f.new_balance_sender = 0 AND f.amount > m.value
+                     THEN 1 ELSE 0 END) AS fraud_and_r01
+        FROM fact_transactions AS f
+        CROSS JOIN median_amount AS m
+    """)
 
-        logger.info(
-            f"Fraud with zero receiver balance: "
-            f"{result[3]} ({result[4]:.2f}%)"
-        )
+    total = counts["total"][0]
+    fraud = counts["fraud"][0]
+    r01_fired = counts["r01_fired"][0]
+    fraud_and_r01 = counts["fraud_and_r01"][0]
 
-        return {
-            "fraud_count": result[0],
-            "zero_sender_count": result[1],
-            "zero_sender_percentage": result[2],
-            "zero_receiver_count": result[3],
-            "zero_receiver_percentage": result[4]
-        }
+    p_fraud = fraud / total
 
-    finally:
-        connection.close()
+    p_r01_given_fraud = fraud_and_r01 / fraud
 
+    p_r01 = r01_fired / total
 
-# ---------------------------------------------------------------------
-# 5. Z-score analysis for fraudulent transaction amounts
-# ---------------------------------------------------------------------
+    p_fraud_given_r01 = p_r01_given_fraud * p_fraud / p_r01
 
-def get_fraud_z_scores():
-    connection = get_connection()
+    logger.info("P(fraud)          = %.6f%%", p_fraud * 100)
+    logger.info("P(R01 | fraud)    = %.4f%%", p_r01_given_fraud * 100)
+    logger.info("P(R01)            = %.4f%%", p_r01 * 100)
+    logger.info("P(fraud | R01)    = %.4f%%  (Bayes)", p_fraud_given_r01 * 100)
+    logger.info("P(fraud | R01)    = %.4f%%  (direct count)", fraud_and_r01 / r01_fired * 100)
 
-    try:
-        result = connection.execute(
-            """
-            WITH transaction_type_statistics AS (
-                SELECT
-                    transaction_type_id,
+    return {
+        "p_fraud": p_fraud * 100,
+        "p_r01_given_fraud": p_r01_given_fraud * 100,
+        "p_r01": p_r01 * 100,
+        "p_fraud_given_r01": p_fraud_given_r01 * 100,
+    }
 
-                    AVG(amount) AS mean_amount,
 
-                    STDDEV_SAMP(amount) AS std_amount
+def save_summary(overall, by_type, amounts, zero_balances, conditional, bayes) -> None:
+    """Collect every number into one table, print it and save it as CSV."""
+    rows = []
 
-                FROM fact_transactions
+    rows.append(("overall", "fraud_rate_pct", overall["fraud_rate"][0]))
+    rows.append(("overall", "fraud_transactions", overall["fraud_transactions"][0]))
+    rows.append(("overall", "total_transactions", overall["total_transactions"][0]))
 
-                GROUP BY transaction_type_id
-            )
+    for i in range(len(by_type)):
+        rows.append(("fraud_by_type", by_type["type_name"][i], by_type["fraud_rate"][i]))
 
-            SELECT
-                tt.type_name AS transaction_type,
+    for i in range(len(amounts)):
+        group = amounts["group_name"][i]
+        rows.append(("amount", group + "_mean", amounts["mean_amount"][i]))
+        rows.append(("amount", group + "_median", amounts["median_amount"][i]))
+        rows.append(("amount", group + "_p95", amounts["p95_amount"][i]))
 
-                ft.transaction_id,
+    rows.append(("zero_balance", "pct_fraud_sender_zero", zero_balances["pct_sender_zero"][0]))
+    rows.append(("zero_balance", "pct_fraud_receiver_zero", zero_balances["pct_receiver_zero"][0]))
 
-                ft.amount,
+    for i in range(len(conditional)):
+        level = conditional["level_name"][i]
+        rows.append(("conditional", "P(fraud|drain>" + level + ")",
+                     conditional["fraud_probability"][i]))
 
-                stats.mean_amount,
+    for key in bayes:
+        rows.append(("bayes", key, bayes[key]))
 
-                stats.std_amount,
+    summary = pd.DataFrame(rows, columns=["section", "metric", "value"])
 
-                (
-                    ft.amount - stats.mean_amount
-                )
-                /
-                NULLIF(stats.std_amount, 0)
-                AS z_score
+    print(summary.to_string(index=False))
 
-            FROM fact_transactions AS ft
+    summary.to_csv(REPORTS_DIR + "/fraud_summary.csv", index=False)
+    logger.info("Saved fraud_summary.csv")
 
-            JOIN transaction_type_statistics AS stats
-                ON ft.transaction_type_id =
-                   stats.transaction_type_id
 
-            JOIN dim_transaction_type AS tt
-                ON ft.transaction_type_id = tt.id
+def main() -> None:
+    """Entry point for Milestone 3.2."""
+    logger.info("Starting fraud analysis")
 
-            WHERE ft.is_fraud = TRUE
+    overall = overall_fraud_rate()
+    by_type = fraud_rate_by_type()
+    amounts = amount_statistics()
+    zero_balances = zero_balance_rates()
 
-            ORDER BY
-                tt.type_name,
-                z_score;
-            """
-        ).fetchdf()
+    z_scores = fraud_z_scores()
+    plot_z_scores(z_scores)
 
-        logger.info(
-            "Fraudulent transaction z-score statistics:"
-        )
+    conditional = conditional_probabilities()
+    bayes = bayes_for_r01()
 
-        summary = (
-            result
-            .groupby("transaction_type")["z_score"]
-            .agg(
-                count="count",
-                mean="mean",
-                median="median",
-                min="min",
-                max="max"
-            )
-            .reset_index()
-        )
+    save_summary(overall, by_type, amounts, zero_balances, conditional, bayes)
 
-        for _, row in summary.iterrows():
-            logger.info(
-                f"Transaction Type: "
-                f"{row['transaction_type']}, "
-                f"Fraud Count: {int(row['count'])}, "
-                f"Mean Z-score: {row['mean']:.2f}, "
-                f"Median Z-score: {row['median']:.2f}, "
-                f"Min Z-score: {row['min']:.2f}, "
-                f"Max Z-score: {row['max']:.2f}"
-            )
-
-        # -------------------------------------------------------------
-        # Box plot
-        # -------------------------------------------------------------
-
-        plt.figure(figsize=(10, 6))
-
-        result.boxplot(
-            column="z_score",
-            by="transaction_type"
-        )
-
-        plt.title(
-            "Fraudulent Transaction Amount Z-Scores "
-            "by Transaction Type"
-        )
-
-        plt.suptitle("")
-
-        plt.xlabel("Transaction Type")
-        plt.ylabel("Z-score")
-
-        plt.axhline(
-            y=0,
-            linestyle="--"
-        )
-
-        plt.tight_layout()
-
-        plt.savefig(
-            ZSCORE_PLOT_PATH,
-            dpi=300
-        )
-
-        plt.close()
-
-        logger.info(
-            f"Z-score box plot saved to "
-            f"{ZSCORE_PLOT_PATH}"
-        )
-
-        return result, summary
-
-    finally:
-        connection.close()
-
-
-# ---------------------------------------------------------------------
-# 6. Conditional probability:
-#
-# P(Fraud | |balance_drain| > threshold)
-#
-# Thresholds:
-# 75th, 90th, 95th and 99th percentile
-# ---------------------------------------------------------------------
-
-def get_balance_drain_conditional_probabilities():
-    connection = get_connection()
-
-    try:
-        result = connection.execute(
-            """
-            WITH thresholds AS (
-                SELECT
-                    QUANTILE_CONT(
-                        ABS(balance_drain),
-                        0.75
-                    ) AS p75,
-
-                    QUANTILE_CONT(
-                        ABS(balance_drain),
-                        0.90
-                    ) AS p90,
-
-                    QUANTILE_CONT(
-                        ABS(balance_drain),
-                        0.95
-                    ) AS p95,
-
-                    QUANTILE_CONT(
-                        ABS(balance_drain),
-                        0.99
-                    ) AS p99
-
-                FROM fact_transactions
-            ),
-
-            threshold_values AS (
-                SELECT
-                    '75th' AS threshold_name,
-                    p75 AS threshold
-                FROM thresholds
-
-                UNION ALL
-
-                SELECT
-                    '90th',
-                    p90
-                FROM thresholds
-
-                UNION ALL
-
-                SELECT
-                    '95th',
-                    p95
-                FROM thresholds
-
-                UNION ALL
-
-                SELECT
-                    '99th',
-                    p99
-                FROM thresholds
-            )
-
-            SELECT
-                tv.threshold_name,
-
-                tv.threshold,
-
-                COUNT(*) FILTER (
-                    WHERE ABS(ft.balance_drain)
-                          > tv.threshold
-                ) AS transactions_above_threshold,
-
-                COUNT(*) FILTER (
-                    WHERE ABS(ft.balance_drain)
-                          > tv.threshold
-
-                      AND ft.is_fraud = TRUE
-                ) AS fraud_above_threshold,
-
-                ROUND(
-                    100.0 *
-
-                    COUNT(*) FILTER (
-                        WHERE ABS(ft.balance_drain)
-                              > tv.threshold
-
-                          AND ft.is_fraud = TRUE
-                    )
-
-                    /
-
-                    NULLIF(
-                        COUNT(*) FILTER (
-                            WHERE ABS(ft.balance_drain)
-                                  > tv.threshold
-                        ),
-                        0
-                    ),
-
-                    4
-                ) AS fraud_probability
-
-            FROM fact_transactions AS ft
-
-            CROSS JOIN threshold_values AS tv
-
-            GROUP BY
-                tv.threshold_name,
-                tv.threshold
-
-            ORDER BY
-                tv.threshold;
-            """
-        ).fetchdf()
-
-        logger.info(
-            "Conditional probability "
-            "P(fraud | |balance_drain| > threshold):"
-        )
-
-        for _, row in result.iterrows():
-            logger.info(
-                f"Threshold: {row['threshold_name']}, "
-                f"Balance Drain > {row['threshold']:.2f}, "
-                f"Transactions: "
-                f"{int(row['transactions_above_threshold'])}, "
-                f"Fraud: "
-                f"{int(row['fraud_above_threshold'])}, "
-                f"P(Fraud | Threshold): "
-                f"{row['fraud_probability']:.4f}%"
-            )
-
-        return result
-
-    finally:
-        connection.close()
-
-
-# ---------------------------------------------------------------------
-# 7. Bayes theorem / R01 proxy
-#
-# R01 proxy:
-#
-# new_balance_sender = 0
-# AND amount > median_amount
-# ---------------------------------------------------------------------
-
-def get_rule_r01_bayes_probability():
-    connection = get_connection()
-
-    try:
-        result = connection.execute(
-            """
-            WITH median_value AS (
-                SELECT
-                    MEDIAN(amount) AS median_amount
-
-                FROM fact_transactions
-            ),
-
-            rule_results AS (
-                SELECT
-
-                    ft.is_fraud,
-
-                    CASE
-                        WHEN
-                            ft.new_balance_sender = 0
-                            AND ft.amount >
-                                mv.median_amount
-                        THEN TRUE
-
-                        ELSE FALSE
-                    END AS rule_r01
-
-                FROM fact_transactions AS ft
-
-                CROSS JOIN median_value AS mv
-            )
-
-            SELECT
-
-                COUNT(*) AS total_transactions,
-
-                COUNT(*) FILTER (
-                    WHERE is_fraud = TRUE
-                ) AS fraud_count,
-
-                COUNT(*) FILTER (
-                    WHERE rule_r01 = TRUE
-                ) AS r01_count,
-
-                COUNT(*) FILTER (
-                    WHERE
-                        is_fraud = TRUE
-                        AND rule_r01 = TRUE
-                ) AS fraud_and_r01_count,
-
-                ROUND(
-                    100.0 *
-
-                    COUNT(*) FILTER (
-                        WHERE is_fraud = TRUE
-                    )
-
-                    / COUNT(*),
-
-                    6
-                ) AS p_fraud,
-
-                ROUND(
-                    100.0 *
-
-                    COUNT(*) FILTER (
-                        WHERE
-                            is_fraud = TRUE
-                            AND rule_r01 = TRUE
-                    )
-
-                    /
-
-                    NULLIF(
-                        COUNT(*) FILTER (
-                            WHERE is_fraud = TRUE
-                        ),
-                        0
-                    ),
-
-                    6
-                ) AS p_r01_given_fraud,
-
-                ROUND(
-                    100.0 *
-
-                    COUNT(*) FILTER (
-                        WHERE rule_r01 = TRUE
-                    )
-
-                    / COUNT(*),
-
-                    6
-                ) AS p_r01,
-
-                ROUND(
-                    100.0 *
-
-                    COUNT(*) FILTER (
-                        WHERE
-                            is_fraud = TRUE
-                            AND rule_r01 = TRUE
-                    )
-
-                    /
-
-                    NULLIF(
-                        COUNT(*) FILTER (
-                            WHERE rule_r01 = TRUE
-                        ),
-                        0
-                    ),
-
-                    6
-                ) AS p_fraud_given_r01
-
-            FROM rule_results;
-            """
-        ).fetchone()
-
-        total_transactions = result[0]
-        fraud_count = result[1]
-        r01_count = result[2]
-        fraud_and_r01_count = result[3]
-
-        p_fraud = result[4]
-        p_r01_given_fraud = result[5]
-        p_r01 = result[6]
-        p_fraud_given_r01 = result[7]
-
-        logger.info(
-            "Bayes analysis for Rule R01 proxy:"
-        )
-
-        logger.info(
-            f"Total transactions: "
-            f"{total_transactions}"
-        )
-
-        logger.info(
-            f"Fraud count: {fraud_count}"
-        )
-
-        logger.info(
-            f"R01 fired: {r01_count}"
-        )
-
-        logger.info(
-            f"Fraud AND R01: "
-            f"{fraud_and_r01_count}"
-        )
-
-        logger.info(
-            f"P(Fraud): {p_fraud:.6f}%"
-        )
-
-        logger.info(
-            f"P(R01 | Fraud): "
-            f"{p_r01_given_fraud:.6f}%"
-        )
-
-        logger.info(
-            f"P(R01): {p_r01:.6f}%"
-        )
-
-        logger.info(
-            f"P(Fraud | R01): "
-            f"{p_fraud_given_r01:.6f}%"
-        )
-
-        # -------------------------------------------------------------
-        # Bayes theorem:
-        #
-        # P(Fraud | R01)
-        #
-        #       P(R01 | Fraud) * P(Fraud)
-        # =     ----------------------------
-        #               P(R01)
-        #
-        # Since the SQL values above are percentages, convert them
-        # to probabilities before performing the multiplication.
-        # -------------------------------------------------------------
-
-        bayes_probability = (
-            (p_r01_given_fraud / 100.0)
-            *
-            (p_fraud / 100.0)
-            /
-            (p_r01 / 100.0)
-        ) * 100.0
-
-        logger.info(
-            f"Bayes calculated P(Fraud | R01): "
-            f"{bayes_probability:.6f}%"
-        )
-
-        return {
-            "total_transactions": total_transactions,
-            "fraud_count": fraud_count,
-            "r01_count": r01_count,
-            "fraud_and_r01_count": fraud_and_r01_count,
-            "p_fraud": p_fraud,
-            "p_r01_given_fraud": p_r01_given_fraud,
-            "p_r01": p_r01,
-            "p_fraud_given_r01": p_fraud_given_r01,
-            "bayes_probability": bayes_probability
-        }
-
-    finally:
-        connection.close()
-
-
-# ---------------------------------------------------------------------
-# 8. Create summary CSV
-# ---------------------------------------------------------------------
-
-def save_fraud_summary(
-    overall_results,
-    type_results,
-    amount_results,
-    zero_balance_results,
-    zscore_summary,
-    conditional_results,
-    bayes_results
-):
-    summary_rows = []
-
-    # -------------------------------------------------------------
-    # Overall fraud
-    # -------------------------------------------------------------
-
-    summary_rows.append({
-        "analysis": "overall_fraud",
-        "category": "overall",
-        "metric": "fraud_count",
-        "value": overall_results["fraud_count"]
-    })
-
-    summary_rows.append({
-        "analysis": "overall_fraud",
-        "category": "overall",
-        "metric": "total_count",
-        "value": overall_results["total_count"]
-    })
-
-    summary_rows.append({
-        "analysis": "overall_fraud",
-        "category": "overall",
-        "metric": "fraud_percentage",
-        "value": overall_results["fraud_percentage"]
-    })
-
-    # -------------------------------------------------------------
-    # Fraud percentage by type
-    # -------------------------------------------------------------
-
-    for _, row in type_results.iterrows():
-
-        summary_rows.append({
-            "analysis": "fraud_by_type",
-            "category": row["transaction_type"],
-            "metric": "fraud_percentage",
-            "value": row["fraud_percentage"]
-        })
-
-    # -------------------------------------------------------------
-    # Amount statistics
-    # -------------------------------------------------------------
-
-    for _, row in amount_results.iterrows():
-
-        category = row["fraud_status"]
-
-        summary_rows.append({
-            "analysis": "amount_statistics",
-            "category": category,
-            "metric": "mean_amount",
-            "value": row["mean_amount"]
-        })
-
-        summary_rows.append({
-            "analysis": "amount_statistics",
-            "category": category,
-            "metric": "median_amount",
-            "value": row["median_amount"]
-        })
-
-        summary_rows.append({
-            "analysis": "amount_statistics",
-            "category": category,
-            "metric": "95th_percentile_amount",
-            "value": row["percentile_95_amount"]
-        })
-
-    # -------------------------------------------------------------
-    # Zero balance
-    # -------------------------------------------------------------
-
-    summary_rows.extend([
-        {
-            "analysis": "zero_balance",
-            "category": "sender",
-            "metric": "fraud_count_zero_balance",
-            "value": zero_balance_results[
-                "zero_sender_count"
-            ]
-        },
-        {
-            "analysis": "zero_balance",
-            "category": "sender",
-            "metric": "percentage",
-            "value": zero_balance_results[
-                "zero_sender_percentage"
-            ]
-        },
-        {
-            "analysis": "zero_balance",
-            "category": "receiver",
-            "metric": "fraud_count_zero_balance",
-            "value": zero_balance_results[
-                "zero_receiver_count"
-            ]
-        },
-        {
-            "analysis": "zero_balance",
-            "category": "receiver",
-            "metric": "percentage",
-            "value": zero_balance_results[
-                "zero_receiver_percentage"
-            ]
-        }
-    ])
-
-    # -------------------------------------------------------------
-    # Z-score
-    # -------------------------------------------------------------
-
-    for _, row in zscore_summary.iterrows():
-
-        summary_rows.extend([
-            {
-                "analysis": "fraud_zscore",
-                "category": row["transaction_type"],
-                "metric": "mean_z_score",
-                "value": row["mean"]
-            },
-            {
-                "analysis": "fraud_zscore",
-                "category": row["transaction_type"],
-                "metric": "median_z_score",
-                "value": row["median"]
-            },
-            {
-                "analysis": "fraud_zscore",
-                "category": row["transaction_type"],
-                "metric": "min_z_score",
-                "value": row["min"]
-            },
-            {
-                "analysis": "fraud_zscore",
-                "category": row["transaction_type"],
-                "metric": "max_z_score",
-                "value": row["max"]
-            }
-        ])
-
-    # -------------------------------------------------------------
-    # Balance drain conditional probability
-    # -------------------------------------------------------------
-
-    for _, row in conditional_results.iterrows():
-
-        summary_rows.append({
-            "analysis": "balance_drain_probability",
-            "category": row["threshold_name"],
-            "metric": "threshold",
-            "value": row["threshold"]
-        })
-
-        summary_rows.append({
-            "analysis": "balance_drain_probability",
-            "category": row["threshold_name"],
-            "metric": "transactions_above_threshold",
-            "value": row[
-                "transactions_above_threshold"
-            ]
-        })
-
-        summary_rows.append({
-            "analysis": "balance_drain_probability",
-            "category": row["threshold_name"],
-            "metric": "fraud_above_threshold",
-            "value": row[
-                "fraud_above_threshold"
-            ]
-        })
-
-        summary_rows.append({
-            "analysis": "balance_drain_probability",
-            "category": row["threshold_name"],
-            "metric": "P(fraud | threshold)",
-            "value": row["fraud_probability"]
-        })
-
-    # -------------------------------------------------------------
-    # Bayes / R01
-    # -------------------------------------------------------------
-
-    summary_rows.extend([
-        {
-            "analysis": "rule_r01_bayes",
-            "category": "R01",
-            "metric": "P(fraud)",
-            "value": bayes_results["p_fraud"]
-        },
-        {
-            "analysis": "rule_r01_bayes",
-            "category": "R01",
-            "metric": "P(R01 | fraud)",
-            "value": bayes_results[
-                "p_r01_given_fraud"
-            ]
-        },
-        {
-            "analysis": "rule_r01_bayes",
-            "category": "R01",
-            "metric": "P(R01)",
-            "value": bayes_results["p_r01"]
-        },
-        {
-            "analysis": "rule_r01_bayes",
-            "category": "R01",
-            "metric": "P(fraud | R01)",
-            "value": bayes_results[
-                "p_fraud_given_r01"
-            ]
-        }
-    ])
-
-    summary = pd.DataFrame(summary_rows)
-
-    # -------------------------------------------------------------
-    # Print summary
-    # -------------------------------------------------------------
-
-    print("\n")
-    print("=" * 80)
-    print("FRAUD ANALYSIS SUMMARY")
-    print("=" * 80)
-
-    print(
-        summary.to_string(
-            index=False
-        )
-    )
-
-    print("=" * 80)
-
-    # -------------------------------------------------------------
-    # Save CSV
-    # -------------------------------------------------------------
-
-    summary.to_csv(
-        SUMMARY_PATH,
-        index=False
-    )
-
-    logger.info(
-        f"Fraud summary saved to {SUMMARY_PATH}"
-    )
-
-    return summary
-
-
-# ---------------------------------------------------------------------
-# 9. Analysis notes
-# ---------------------------------------------------------------------
-
-def save_analysis_notes(
-    overall_results,
-    type_results,
-    amount_results,
-    zero_balance_results,
-    conditional_results,
-    bayes_results
-):
-    fraud_percentage = overall_results[
-        "fraud_percentage"
-    ]
-
-    fraud_amount = amount_results[
-        amount_results["fraud_status"] == "Fraud"
-    ].iloc[0]
-
-    non_fraud_amount = amount_results[
-        amount_results["fraud_status"] == "Non-Fraud"
-    ].iloc[0]
-
-    highest_risk_type = type_results.iloc[0]
-
-    notes = f"""# Fraud Analysis Notes
-
-## Overall Fraud Rate
-
-The dataset contains {overall_results["total_count"]:,}
-transactions, of which {overall_results["fraud_count"]:,}
-are fraudulent.
-
-The overall fraud rate is
-**{fraud_percentage:.2f}%**.
-
-This indicates a highly imbalanced fraud classification problem.
-
-## Fraud by Transaction Type
-
-The transaction type with the highest fraud percentage is
-**{highest_risk_type["transaction_type"]}**, with a fraud rate of
-**{highest_risk_type["fraud_percentage"]:.2f}%**.
-
-## Transaction Amount Statistics
-
-### Fraudulent Transactions
-
-Mean amount:
-
-**{fraud_amount["mean_amount"]:,.2f}**
-
-Median amount:
-
-**{fraud_amount["median_amount"]:,.2f}**
-
-95th percentile:
-
-**{fraud_amount["percentile_95_amount"]:,.2f}**
-
-### Non-Fraudulent Transactions
-
-Mean amount:
-
-**{non_fraud_amount["mean_amount"]:,.2f}**
-
-Median amount:
-
-**{non_fraud_amount["median_amount"]:,.2f}**
-
-95th percentile:
-
-**{non_fraud_amount["percentile_95_amount"]:,.2f}**
-
-The fraudulent transactions therefore exhibit substantially
-different transaction amount distributions from non-fraudulent
-transactions.
-
-## Zero Balance Analysis
-
-Among fraudulent transactions:
-
-- Zero sender balance: **{zero_balance_results["zero_sender_percentage"]:.2f}%**
-- Zero receiver balance: **{zero_balance_results["zero_receiver_percentage"]:.2f}%**
-
-These are descriptive characteristics of the PaySim dataset and
-should not independently be interpreted as proof of fraudulent
-behavior in real-world transactions.
-
-## Balance Drain Conditional Probability
-
-The conditional probability
-
-**P(fraud | |balance_drain| > threshold)**
-
-was calculated at the 75th, 90th, 95th and 99th percentiles.
-
-All percentile thresholds and conditional probabilities were
-calculated directly using DuckDB SQL.
-
-"""
-
-    notes += "\n| Threshold | P(Fraud \\| Drain > Threshold) |\n"
-    notes += "|---|---:|\n"
-
-    for _, row in conditional_results.iterrows():
-        notes += (
-            f"| {row['threshold_name']} | "
-            f"{row['fraud_probability']:.4f}% |\n"
-        )
-
-    notes += f"""
-
-## Rule R01 Proxy
-
-The temporary Rule R01 proxy is:
-
-`new_balance_sender = 0 AND amount > median_amount`
-
-The base fraud probability is:
-
-**P(Fraud) = {bayes_results["p_fraud"]:.6f}%**
-
-The probability that R01 fires given fraud is:
-
-**P(R01 | Fraud) = {bayes_results["p_r01_given_fraud"]:.6f}%**
-
-The probability that R01 fires overall is:
-
-**P(R01) = {bayes_results["p_r01"]:.6f}%**
-
-Using Bayes' theorem:
-
-P(Fraud | R01)
-=
-P(R01 | Fraud) × P(Fraud)
-/
-P(R01)
-
-The resulting posterior probability is:
-
-**P(Fraud | R01) = {bayes_results["p_fraud_given_r01"]:.6f}%**
-
-This R01 definition is a proxy for the future formal rule and
-should be revisited when the formal rule is defined.
-"""
-
-    NOTES_PATH.write_text(
-        notes,
-        encoding="utf-8"
-    )
-
-    logger.info(
-        f"Analysis notes saved to {NOTES_PATH}"
-    )
-
-
-# ---------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------
-
-def main():
-
-    REPORTS_DIR.mkdir(
-        parents=True,
-        exist_ok=True
-    )
-
-    logger.info(
-        "Starting fraud analysis"
-    )
-
-    # 1. Overall fraud
-    overall_results = get_fraud_percentage()
-
-    logger.info(
-        "Fraud analysis completed."
-    )
-
-    # 2. Fraud by transaction type
-    type_results = (
-        get_fraud_percentage_by_transaction_type()
-    )
-
-    logger.info(
-        "Fraud analysis by category completed."
-    )
-
-    # 3. Amount statistics
-    amount_results = (
-        get_transaction_statistics_by_fraud_status()
-    )
-
-    logger.info(
-        "Transaction statistics analysis completed."
-    )
-
-    # 4. Zero balances
-    zero_balance_results = (
-        get_zero_balance_fraud_percentage()
-    )
-
-    logger.info(
-        "Zero balance fraud analysis completed."
-    )
-
-    # 5. Z-score analysis + box plot
-    zscore_result, zscore_summary = (
-        get_fraud_z_scores()
-    )
-
-    logger.info(
-        "Fraud z-score analysis completed."
-    )
-
-    # 6. Balance drain conditional probabilities
-    conditional_results = (
-        get_balance_drain_conditional_probabilities()
-    )
-
-    logger.info(
-        "Balance drain conditional probability "
-        "analysis completed."
-    )
-
-    # 7. Bayes / R01
-    bayes_results = (
-        get_rule_r01_bayes_probability()
-    )
-
-    logger.info(
-        "Rule R01 Bayes analysis completed."
-    )
-
-    # 8. Save summary
-    save_fraud_summary(
-        overall_results,
-        type_results,
-        amount_results,
-        zero_balance_results,
-        zscore_summary,
-        conditional_results,
-        bayes_results
-    )
-
-    # 9. Save analysis notes
-    save_analysis_notes(
-        overall_results,
-        type_results,
-        amount_results,
-        zero_balance_results,
-        conditional_results,
-        bayes_results
-    )
-
-    logger.info(
-        "Fraud analysis completed successfully."
-    )
+    logger.info("Fraud analysis completed")
 
 
 if __name__ == "__main__":

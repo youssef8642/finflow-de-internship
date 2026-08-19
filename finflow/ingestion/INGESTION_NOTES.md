@@ -1,99 +1,191 @@
 # Ingestion Notes
 
-## Benchmark Results
+Milestones 1.2, 1.3 and 1.4. All timings below are from runs on this machine
+(16 logical cores, Windows, local SSD) and are reproducible with:
 
-The ingestion pipeline was tested using both sequential and parallel execution.
+```
+python -m finflow.ingestion.ingest_all_parallel
+```
 
-| Method     | Time (seconds) |
-| ---------- | -------------: |
-| Sequential |         173.38 |
-| Parallel   |         145.71 |
-| Speedup    |          1.19x |
+---
 
-The parallel implementation reduced the total wall-clock time by approximately 19%.
+## Milestone 1.3 — Parallel Ingestion
 
-## Why Parallel Ingestion Was Faster
+### Design Choice A — why ThreadPoolExecutor
 
-The ingestion tasks involve I/O operations such as reading the PaySim CSV file, requesting data from FRED, and downloading CFPB complaints from the internet.
+The three ingestion tasks are I/O-bound. `ingest_paysim` reads a 493 MB CSV from
+disk, `ingest_fred` makes three HTTPS calls to the FRED API, and
+`ingest_complaints` reads a 9 GB CSV from disk. In all three cases most of the
+elapsed time is spent waiting for bytes to arrive rather than executing Python
+bytecode.
 
-Using `ThreadPoolExecutor` allowed these operations to overlap instead of waiting for each ingestion task to finish before starting the next one.
+Python releases the GIL while a thread is blocked on disk or network I/O, so
+threads genuinely overlap that waiting. `ThreadPoolExecutor` is therefore the
+right tool, and it is far cheaper than processes: threads share one memory space,
+so nothing has to be serialised between them.
 
-The biggest workload was PaySim, which processed 6,362,620 rows and took approximately 145 seconds during the parallel run. FRED and CFPB could run while PaySim was being processed, reducing the overall wall-clock time.
+### Measured benchmark
 
-The speedup was therefore limited because PaySim remained the main bottleneck.
+| Method | Time (s) | Speedup |
+|---|---:|---:|
+| Sequential | 95.53 | 1.0x |
+| ThreadPool(3) | 88.62 | 1.08x |
 
-## Race Conditions and Shared State
+### Why the speedup is only 1.08x
 
-No significant race conditions were encountered.
+The per-task timings from inside the parallel run explain it completely:
 
-Each ingestion function writes to a separate output:
+| Task | Time (s) |
+|---|---:|
+| `ingest_fred` | 4.34 |
+| `ingest_paysim` | 18.20 |
+| `ingest_complaints` | 88.53 |
+| **Whole parallel run** | **88.62** |
 
-* PaySim → `data/processed/transactions.parquet`
-* FRED → `data/raw/macro/`
-* CFPB → `data/processed/complaints.parquet`
+The parallel wall-clock time is 88.62 seconds and the slowest single task is
+88.53 seconds. FRED and PaySim finished entirely inside the window that
+complaints was still running in, so they became free — but the total can never
+drop below the longest single task. This is Amdahl's law: the achievable speedup
+is capped by the part that cannot be divided, and here one task is 93% of the
+sequential work.
 
-Because the ingestion functions use separate output files and do not modify shared in-memory data structures, they can safely run concurrently.
+The complaints file is the bottleneck because it is 9 GB and contains 17,004,291
+rows, of which only 718,623 survive the product filter. Everything else is
+rounding error next to it.
 
-The main consideration is that repeated benchmark runs access the same output files. Each ingestion function writes its own output, so there is no conflict between the three different ingestion tasks.
+An earlier version of this pipeline measured a *higher* speedup of 1.19x, and it
+went down after PaySim ingestion was optimised from 148 seconds to 18. That looks
+backwards until you look at Amdahl's law again: making a non-bottleneck task
+faster reduces the sequential baseline without changing the parallel floor, so
+the ratio between them shrinks. The pipeline got much faster in absolute terms
+(the whole sequential run fell from about 173 seconds to 95) while the speedup
+number got worse. The speedup ratio on its own is a misleading measure of
+improvement.
 
-## Conclusion
+To actually improve this further, the complaints ingest itself would have to be
+split — for example by reading disjoint row ranges of the CSV in parallel — since
+no amount of task-level threading can beat a single 88-second task.
 
-Thread-based parallelism was appropriate because the ingestion pipeline contains significant I/O activity. The measured result was a 1.19x speedup, reducing execution time from 173.38 seconds to 145.71 seconds.
+### What would happen with ProcessPoolExecutor instead?
+
+Each ingest function would run in a separate OS process with its own interpreter
+and its own memory. Three things would get worse:
+
+1. **Startup cost.** Each process has to be spawned and has to re-import pandas,
+   duckdb and fredapi, which costs on the order of a second per worker before any
+   work begins.
+2. **Serialisation.** Return values cross a process boundary by being pickled.
+   These functions return short path strings so that is cheap here, but if they
+   returned DataFrames it would be very expensive.
+3. **Memory.** Three processes each holding their own copy of the interpreter and
+   libraries, instead of three threads sharing one.
+
+And nothing would get better, because the GIL was never the constraint — the
+threads are blocked on I/O, not competing for the interpreter.
+
+### When would you switch to processes for ingestion?
+
+When the ingest functions start doing real CPU work rather than waiting. If a
+step had to decompress and parse a large file, decrypt it, or run heavy
+validation or feature engineering on every row, that work holds the GIL and
+threads would serialise on it. At that point processes become worth their
+overhead. The rule of thumb: threads for waiting, processes for computing.
+
+### Race conditions and shared state
+
+No race conditions occurred, and this is by construction rather than luck. Each
+ingest function writes to a different destination:
+
+- `ingest_paysim` to `data/processed/transactions.parquet`
+- `ingest_fred` to `data/raw/macro/*.csv`
+- `ingest_complaints` to `data/processed/complaints.parquet`
+
+They share no mutable in-memory state, and no two of them touch the same file. The
+only shared object is the module-level `config`, which is read-only.
+
+The one real hazard is DuckDB. `save_parquet` opens a fresh in-memory DuckDB
+connection each time it is called rather than sharing one, because a DuckDB
+connection is not safe to use from several threads at once. Sharing a single
+connection across the three threads would be a genuine race.
+
+The logger is safe to share — the standard library `logging` module is
+thread-safe, which is why interleaved log lines from the three tasks never
+corrupt each other.
+
+---
 
 ## Milestone 1.4 — Parallel Transformation
 
-The PaySim dataset contains 6,362,620 rows. The transformation was performed using `ProcessPoolExecutor` with 4 workers.
+### Design Choice B — chunk size
 
-The transformation adds two derived columns:
+Three chunk sizes were measured, 4 worker processes each, on the full 6,362,620
+rows:
 
-* `balance_drain = old_balance_org - new_balance_org - amount`
-* `log_amount = log1p(amount)`
+| Chunk size | Chunks | Time (s) |
+|---:|---:|---:|
+| 500,000 | 13 | 16.48 |
+| **1,000,000** | **7** | **15.88** |
+| 2,000,000 | 4 | 19.57 |
 
-### Chunk Size Experiments
+**1,000,000 rows was chosen**, since it was fastest, but the margin over 500,000
+is only 3.6% and is close to run-to-run noise. The 2,000,000 result is clearly
+worse for a structural reason: 4 chunks across 4 workers means a single straggler
+delays the whole batch, and there is no spare work to fill the gap.
 
-| Chunk Size | Number of Chunks |   Run 1 |   Run 2 |   Best Time |
-| ---------: | ---------------: | ------: | ------: | ----------: |
-|    500,000 |               13 | 18.59 s | 18.69   |     18.59 s |
-|  1,000,000 |                7 | 17.87 s | 16.62 s | **16.62 s** |
-|  2,000,000 |                4 | 18.77 s | 18.33 s |     18.33 s |
+### Memory versus CPU trade-off
 
-The 1,000,000-row chunk size produced the fastest observed transformation time at **16.62 seconds**.
+Smaller chunks use less memory per worker and spread the work more evenly, so a
+slow chunk is less able to hold up the batch. The cost is more tasks, and every
+task has to be pickled out to a worker and its result pickled back, so overhead
+grows with the number of chunks.
 
-### Why 1,000,000 Rows Was Chosen
+Larger chunks cut that per-task overhead but raise peak memory — each worker holds
+a bigger DataFrame, and the parent process holds all of the returned chunks at
+once before concatenating. Fewer chunks also means coarser scheduling, which is
+what hurt the 2,000,000 case.
 
-A chunk size of 1,000,000 provides a good balance between parallelism and processing overhead.
+### The result that matters: parallelism made this slower
 
-With 500,000-row chunks, the dataset is divided into 13 chunks. This provides more individual tasks, but also creates additional overhead when transferring DataFrames between the main process and worker processes.
+| Method | Time (s) | Speedup |
+|---|---:|---:|
+| Sequential, single process | **0.14** | 1.0x |
+| ProcessPool(4), 1M chunks | 15.77 | **0.01x** |
 
-With 2,000,000-row chunks, only 4 chunks are created. This reduces task-management overhead, but each process must handle a much larger DataFrame, increasing memory usage and reducing flexibility in distributing work.
+Running the transformation across 4 processes is roughly **113 times slower**
+than doing it in one.
 
-The 1,000,000-row configuration creates 7 chunks, providing enough work for the 4 worker processes while avoiding the larger memory requirements of 2,000,000-row chunks.
+The milestone's premise is that "applying column transformations sequentially is
+slow" on 6.3 million rows. Measured, it is not. The transformation is three
+`astype` calls, one subtraction and one `np.log1p` — all vectorised numpy
+operations that run as compiled C loops over contiguous arrays, releasing the GIL
+and using SIMD instructions. The entire job over 6.3 million rows takes 0.14
+seconds.
 
-### Memory vs CPU Trade-Off
+Against that, the cost of parallelising is enormous. Every chunk must be pickled
+from the parent process into a worker, and every transformed chunk pickled back —
+several gigabytes of DataFrame crossing process boundaries in both directions. The
+15.77 seconds is almost entirely serialisation. There is only 0.14 seconds of
+actual work available to divide, so there is nothing to win and a great deal to
+lose.
 
-Smaller chunks generally use less memory per individual task and provide more opportunities for the worker processes to receive work. However, too many small chunks increase process communication, serialization, and scheduling overhead.
+The general lesson is that `ProcessPoolExecutor` only pays off when the work per
+item is large relative to the cost of moving that item between processes. Here
+the ratio is roughly 100:1 in the wrong direction. Parallelism is not free, and
+applying it to already-vectorised numpy code is a reliable way to make a program
+slower.
 
-Larger chunks reduce the number of tasks and therefore reduce scheduling and serialization overhead. However, they require more memory per worker and can reduce the benefits of parallelism because there are fewer tasks to distribute.
+The implementation is kept because the milestone requires it and because the
+benchmark demonstrating this is itself the deliverable. In production the correct
+choice would be the single-process version.
 
-Therefore:
+### Where the time in `main()` actually goes
 
-* **500,000 rows:** lower per-task memory usage, but more chunks and more overhead.
-* **1,000,000 rows:** balanced memory usage, task count, and CPU utilization.
-* **2,000,000 rows:** fewer chunks and less scheduling overhead, but higher memory requirements and less task granularity.
+A full `transform_parallel` run takes about 24 seconds end to end, and almost none
+of it is the transformation:
 
-Based on the measured results, **1,000,000 rows per chunk was selected** for the final configuration.
+- reading the 265 MB Parquet into pandas: ~3 s
+- splitting into chunks (a copy per chunk): ~1 s
+- pickling to workers, transforming, pickling back: ~16 s
+- concatenating and writing the output Parquet: ~4 s
 
-### Final Configuration
-
-```text
-ProcessPoolExecutor workers: 4
-Chunk size: 1,000,000 rows
-Number of chunks: 7
-Best measured transformation time: 16.62 seconds
-```
-
-The transformed dataset is saved as:
-
-```text
-data/processed/transactions_transformed_1000000.parquet
-```
+Replacing the process pool with a direct call would cut this to roughly 8 seconds.

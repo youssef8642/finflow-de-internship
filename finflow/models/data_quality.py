@@ -1,116 +1,102 @@
-"""Data quality checks that gate the pipeline before analysis runs."""
+"""Milestone 2.3 - Data quality checks.
 
-from __future__ import annotations
+Order of this file follows the milestone bullets:
+    1. no duplicated transaction_id in fact_transactions
+    2. is_fraud null rate is 0%
+    3. every foreign key has a match in its dimension table
+    4. amount has no negative values
 
-from pathlib import Path
+The pipeline should not continue to the analysis stage if a check fails,
+so every check raises DataQualityError instead of just logging a warning.
+"""
 
 import duckdb
 
 from finflow.config.logger import get_logger
 from finflow.config.settings import PipelineConfig
 
-
 logger = get_logger(__name__)
-
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
-CONFIG = PipelineConfig()
-
-DATABASE_PATH = PROJECT_ROOT / CONFIG.db_path
-
-# Every foreign key in the fact table, with the dimension it has to resolve to.
-FOREIGN_KEYS = [
-    ("transaction_type_id", "dim_transaction_type", "transaction type"),
-    ("sender_account_id", "dim_account", "sender account"),
-    ("receiver_account_id", "dim_account", "receiver account"),
-    ("step", "dim_time", "time"),
-]
+config = PipelineConfig()
 
 
 class DataQualityError(Exception):
-    """Raised when a data quality check fails."""
+    """Raised when one of the quality checks fails."""
 
 
-def _count(connection: duckdb.DuckDBPyConnection, sql: str) -> int:
-    """Run a scalar COUNT query and return the result."""
-    return connection.execute(sql).fetchone()[0]
-
-
-def check_duplicate_transaction_ids(connection: duckdb.DuckDBPyConnection) -> None:
-    """Fail if the fact table primary key is not unique."""
-    duplicates = _count(
-        connection,
-        """
+def check_duplicate_ids(connection) -> None:
+    """Check 1: transaction_id must be unique."""
+    duplicates = connection.execute("""
         SELECT COUNT(*) FROM (
             SELECT transaction_id
             FROM fact_transactions
             GROUP BY transaction_id
             HAVING COUNT(*) > 1
         )
-        """,
-    )
+    """).fetchone()[0]
 
-    if duplicates:
-        raise DataQualityError(
-            f"Duplicate transaction_id values found: {duplicates}"
-        )
+    if duplicates > 0:
+        raise DataQualityError(f"Found {duplicates} duplicated transaction_id values")
 
-    logger.info("Duplicate transaction_id check passed")
+    logger.info("Check 1 passed: transaction_id is unique")
 
 
-def check_fraud_nulls(connection: duckdb.DuckDBPyConnection) -> None:
-    """Fail if is_fraud has any nulls -- the label has to be complete."""
-    nulls = _count(
-        connection,
-        "SELECT COUNT(*) FROM fact_transactions WHERE is_fraud IS NULL",
-    )
+def check_fraud_nulls(connection) -> None:
+    """Check 2: is_fraud must never be null."""
+    nulls = connection.execute("""
+        SELECT COUNT(*)
+        FROM fact_transactions
+        WHERE is_fraud IS NULL
+    """).fetchone()[0]
 
-    if nulls:
-        raise DataQualityError(f"is_fraud contains {nulls} NULL values")
+    if nulls > 0:
+        raise DataQualityError(f"is_fraud has {nulls} null values")
 
-    logger.info("is_fraud NULL check passed")
+    logger.info("Check 2 passed: is_fraud has no nulls")
 
 
-def check_foreign_keys(connection: duckdb.DuckDBPyConnection) -> None:
-    """Fail if any fact table foreign key has no row in its dimension."""
-    for column, dimension, label in FOREIGN_KEYS:
-        dimension_key = "step" if dimension == "dim_time" else "id"
+def check_foreign_keys(connection) -> None:
+    """Check 3: every foreign key must exist in its dimension table."""
+    checks = [
+        ("transaction_type_id", "dim_transaction_type", "id"),
+        ("sender_account_id", "dim_account", "id"),
+        ("receiver_account_id", "dim_account", "id"),
+        ("step", "dim_time", "step"),
+    ]
 
-        orphans = _count(
-            connection,
-            f"""
+    for column, dimension, dimension_key in checks:
+        missing = connection.execute(f"""
             SELECT COUNT(*)
-            FROM fact_transactions AS ft
-            LEFT JOIN {dimension} AS d ON ft.{column} = d.{dimension_key}
+            FROM fact_transactions AS f
+            LEFT JOIN {dimension} AS d
+                ON f.{column} = d.{dimension_key}
             WHERE d.{dimension_key} IS NULL
-            """,
-        )
+        """).fetchone()[0]
 
-        if orphans:
-            raise DataQualityError(
-                f"Missing {label} foreign keys: {orphans}"
-            )
+        if missing > 0:
+            raise DataQualityError(f"{column} has {missing} rows with no matching dimension row")
 
-        logger.info("%s foreign key check passed", label.capitalize())
+        logger.info("Check 3 passed for %s", column)
 
 
-def check_negative_amounts(connection: duckdb.DuckDBPyConnection) -> None:
-    """Fail if any transaction has a negative amount."""
-    negatives = _count(
-        connection,
-        "SELECT COUNT(*) FROM fact_transactions WHERE amount < 0",
-    )
+def check_negative_amounts(connection) -> None:
+    """Check 4: amount must never be negative."""
+    negatives = connection.execute("""
+        SELECT COUNT(*)
+        FROM fact_transactions
+        WHERE amount < 0
+    """).fetchone()[0]
 
-    if negatives:
-        raise DataQualityError(f"Negative transaction amounts found: {negatives}")
+    if negatives > 0:
+        raise DataQualityError(f"Found {negatives} negative amounts")
 
-    logger.info("Negative amount check passed")
+    logger.info("Check 4 passed: no negative amounts")
 
 
-def run_quality_checks(connection: duckdb.DuckDBPyConnection) -> None:
-    """Run every quality check, raising DataQualityError on the first failure."""
-    logger.info("Starting data quality checks")
+def run_quality_checks(connection) -> None:
+    """Run all four checks. Stops at the first failure."""
+    logger.info("Running data quality checks")
 
-    check_duplicate_transaction_ids(connection)
+    check_duplicate_ids(connection)
     check_fraud_nulls(connection)
     check_foreign_keys(connection)
     check_negative_amounts(connection)
@@ -119,15 +105,10 @@ def run_quality_checks(connection: duckdb.DuckDBPyConnection) -> None:
 
 
 def main() -> None:
-    """Run the quality checks against the project database."""
-    with duckdb.connect(str(DATABASE_PATH)) as connection:
-        connection.execute("PRAGMA enable_progress_bar=false")
-
-        try:
-            run_quality_checks(connection)
-        except DataQualityError as error:
-            logger.error("Data quality check failed: %s", error)
-            raise
+    """Entry point for Milestone 2.3."""
+    connection = duckdb.connect(config.db_path)
+    run_quality_checks(connection)
+    connection.close()
 
 
 if __name__ == "__main__":

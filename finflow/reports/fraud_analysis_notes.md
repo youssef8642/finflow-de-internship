@@ -111,3 +111,6 @@ P(R01)
 The resulting posterior probability is:
 
 **P(Fraud | R01) = 0.327243%**
+
+This R01 definition is a proxy for the future formal rule and
+should be revisited when the formal rule is defined.

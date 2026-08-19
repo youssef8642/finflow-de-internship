@@ -51,4 +51,4 @@ SELECT
 FROM fact_transactions
 WHERE
     is_fraud = FALSE
-    AND ABS(balance_drain) > 0.01;
+    AND ABS(balance_drain) > 0.1;

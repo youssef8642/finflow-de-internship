@@ -1,47 +1,25 @@
-analysis,category,metric,value
-overall_fraud,overall,fraud_count,8213.0
-overall_fraud,overall,total_count,6362620.0
-overall_fraud,overall,fraud_percentage,0.12908204481801522
-fraud_by_type,TRANSFER,fraud_percentage,0.77
-fraud_by_type,CASH_OUT,fraud_percentage,0.18
-fraud_by_type,CASH_IN,fraud_percentage,0.0
-fraud_by_type,PAYMENT,fraud_percentage,0.0
-fraud_by_type,DEBIT,fraud_percentage,0.0
-amount_statistics,Fraud,mean_amount,1467967.3
-amount_statistics,Fraud,median_amount,441423.44
-amount_statistics,Fraud,95th_percentile_amount,8006429.04
-amount_statistics,Non-Fraud,mean_amount,178197.04
-amount_statistics,Non-Fraud,median_amount,74684.72
-amount_statistics,Non-Fraud,95th_percentile_amount,515610.42
-zero_balance,sender,fraud_count_zero_balance,8053.0
-zero_balance,sender,percentage,98.05
-zero_balance,receiver,fraud_count_zero_balance,4091.0
-zero_balance,receiver,percentage,49.81
-fraud_zscore,CASH_OUT,mean_z_score,7.2938486586284865
-fraud_zscore,CASH_OUT,median_z_score,1.4786021699718441
-fraud_zscore,CASH_OUT,min_z_score,-1.0053853946200606
-fraud_zscore,CASH_OUT,max_z_score,56.03000257939911
-fraud_zscore,TRANSFER,mean_z_score,0.3033904524180302
-fraud_zscore,TRANSFER,median_z_score,-0.2473652892502735
-fraud_zscore,TRANSFER,min_z_score,-0.48446266966449053
-fraud_zscore,TRANSFER,max_z_score,4.835859225808054
-balance_drain_probability,75th,threshold,249641.08750000002
-balance_drain_probability,75th,transactions_above_threshold,1590655.0
-balance_drain_probability,75th,fraud_above_threshold,27.0
-balance_drain_probability,75th,P(fraud | threshold),0.0017
-balance_drain_probability,90th,threshold,487768.9680000002
-balance_drain_probability,90th,transactions_above_threshold,636262.0
-balance_drain_probability,90th,fraud_above_threshold,19.0
-balance_drain_probability,90th,P(fraud | threshold),0.003
-balance_drain_probability,95th,threshold,700716.7694999998
-balance_drain_probability,95th,transactions_above_threshold,318131.0
-balance_drain_probability,95th,fraud_above_threshold,16.0
-balance_drain_probability,95th,P(fraud | threshold),0.005
-balance_drain_probability,99th,threshold,1559494.90879998
-balance_drain_probability,99th,transactions_above_threshold,63627.0
-balance_drain_probability,99th,fraud_above_threshold,13.0
-balance_drain_probability,99th,P(fraud | threshold),0.0204
-rule_r01_bayes,R01,P(fraud),0.129082
-rule_r01_bayes,R01,P(R01 | fraud),80.944844
-rule_r01_bayes,R01,P(R01),31.928985
-rule_r01_bayes,R01,P(fraud | R01),0.327243
+section,metric,value
+overall,fraud_rate_pct,0.12908204481801522
+overall,fraud_transactions,8213.0
+overall,total_transactions,6362620.0
+fraud_by_type,TRANSFER,0.7687991758442811
+fraud_by_type,CASH_OUT,0.18395530726256984
+fraud_by_type,PAYMENT,0.0
+fraud_by_type,CASH_IN,0.0
+fraud_by_type,DEBIT,0.0
+amount,fraud_mean,1467967.299140387
+amount,fraud_median,441423.44
+amount,fraud_p95,8006429.04
+amount,non_fraud_mean,178197.04172740778
+amount,non_fraud_median,74684.72
+amount,non_fraud_p95,515610.4229999998
+zero_balance,pct_fraud_sender_zero,98.05186898818945
+zero_balance,pct_fraud_receiver_zero,49.811274808230856
+conditional,P(fraud|drain>75th),0.0016974139584007846
+conditional,P(fraud|drain>90th),0.0029861912231124916
+conditional,P(fraud|drain>95th),0.00502937469155788
+conditional,P(fraud|drain>99th),0.020431577789303282
+bayes,p_fraud,0.12908204481801522
+bayes,p_r01_given_fraud,80.94484354072812
+bayes,p_r01,31.9289852293552
+bayes,p_fraud_given_r01,0.3272426557454517
